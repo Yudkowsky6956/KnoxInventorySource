@@ -1,0 +1,2252 @@
+-- Look of the whole mod in one place: colors, sizes, fonts.
+-- Colors match the approved mockup (dark Tarkov palette, sand accent).
+
+KnoxTheme = KnoxTheme or {}
+local T = KnoxTheme
+
+-- Which of Knox's mods this is: the released one ("KnoxInventory") or the beta
+-- shipped next to it in the same Workshop item ("KnoxInventoryBeta", 2026-10-20).
+-- The beta's build writes shared/Knox/KnoxModId.lua (tools/prepare_workshop.ps1);
+-- the mod's own files (news) are read under this id. Both ids count as Knox in a
+-- save's mods (KnoxSaveGuard); the two can't be on together (mod.info incompatible).
+T.MOD_IDS = {"KnoxInventory", "KnoxInventoryBeta"}
+T.MOD_ID = KnoxModId or "KnoxInventory"
+
+-- Knox Inventory runs on its Java part (KnoxInventoryJava.jar, loaded by
+-- ZombieBuddy): Knox's fonts, tooltips, model framing, the live character.
+-- Without it (ZombieBuddy missing or not started, or an older jar) nothing of
+-- the game is replaced - the player gets the game's own UI and a message.
+-- (raised with every change of the jar: Lua of one release with the jar of
+-- another, both "22", failed on calls the older jar lacked - 0.9.5, 14.10.2026)
+T.JAVA_NEEDED = 165
+T.javaVersion = knoxJavaVersion and tonumber(knoxJavaVersion()) or nil
+T.active = T.javaVersion ~= nil and T.javaVersion >= T.JAVA_NEEDED
+
+-- Settings: Zomboid/Lua/knox_settings.txt, "key=value" lines. Read once, when
+-- the Lua loads (much of the mod decides what to replace right then).
+local SETTINGS_FILE = "knox_settings.txt"
+T.settings = {}
+do
+    local r = getFileReader(SETTINGS_FILE, false)
+    if r then
+        local line = r:readLine()
+        while line do
+            local k, v = string.match(line, "^%s*([%w_%.]+)%s*=%s*(.-)%s*$")
+            if k then T.settings[k] = v end
+            line = r:readLine()
+        end
+        r:close()
+    end
+end
+
+function T.saveSettings()
+    local w = getFileWriter(SETTINGS_FILE, true, false)
+    if not w then return end
+    local keys = {}
+    for k in pairs(T.settings) do table.insert(keys, k) end
+    table.sort(keys)
+    for _, k in ipairs(keys) do w:write(k .. "=" .. tostring(T.settings[k]) .. "\r\n") end
+    w:close()
+end
+
+-- Modules: the parts of the mod a player can switch off, each leaving the
+-- game's own screens in its place - each on its own, so that the game's (or
+-- another mod's) inventory can go with Knox's windows and the other way round.
+-- In a game:
+--   inventory  the Knox screen on the inventory key (bag windows, inspect, search; the
+--              world's clicks on containers, Viewpoint's loot key and Grab go to it)
+--   hotbar     the quick slots bar in the world in Knox's look, with the hands
+--              (off: the game's bar - or another mod's, Clean UI and the like)
+--   devices    the TV and radio windows
+--   stove      the stove / oven / microwave window
+--   generator  the generator's window (KnoxGeneratorWindow; the start's chance is Knox's either way)
+--   fluids     the window for pouring fluids
+--   tooltips   item tooltips in Knox's look
+--   menus      right-click menus and the game's question boxes in Knox's look
+--   dashboard  the car's dashboard and its radio with the player's music (KnoxDashboard)
+--   health     the inventory screen's Health tab and the health key (KnoxHealthPanel;
+--              off: the game's health window - and with the inventory module off)
+-- Outside a game:
+--   menu       the main menu's camp, its items and the news cards
+--   newgame    game mode, spawn, sandbox, character creation, the loading screen, Load / Options / Mods
+-- A switch works from the next load of the Lua (T.setModule only writes it down).
+-- (health: put off until 2.0 by the author, 2026-10-19 - not in the list, off for
+-- players; on only where the settings file has dev.health=1, the developer's bench)
+T.MODULE_GROUPS = {
+    {id = "game", list = {"inventory", "hotbar", "devices", "stove", "generator", "fluids", "tooltips", "menus", "dashboard", "rmenu"}},
+    {id = "out", list = {"menu", "newgame"}},
+}
+T.MODULES = {}
+for _, g in ipairs(T.MODULE_GROUPS) do
+    for _, name in ipairs(g.list) do table.insert(T.MODULES, name) end
+end
+-- (up to 0.9.8: one "ingame" switch for all the parts in a game - a player who had
+-- it off has each of them off, until they are set one by one)
+if T.settings["module.ingame"] == "0" then
+    for _, name in ipairs(T.MODULE_GROUPS[1].list) do
+        if T.settings["module." .. name] == nil then T.settings["module." .. name] = "0" end
+    end
+end
+T.settings["module.ingame"] = nil
+T.modules = {}
+for _, name in ipairs(T.MODULES) do T.modules[name] = T.settings["module." .. name] ~= "0" end
+T.modules.health = T.settings["dev.health"] == "1"
+
+--- Does this part of the mod replace the game's? (Never without the Java part.)
+function T.on(name)
+    return T.active and T.modules[name] == true
+end
+
+-- A handler of every frame with nothing to do in a game: taken off as one starts, unless one
+-- of the named modules ("game": any in a game) is on. Lua is loaded anew on the way back to the menu (IngameState.exit),
+-- so there it is back. (A player with the menus only saw Knox at half the game's calls in a
+-- profiler - near-empty handlers, but none of them had any reason to run: 2026-11-06.)
+local offInGame = {}
+local function anyGameModule()
+    local any = false
+    for _, name in ipairs(T.MODULE_GROUPS[1].list) do any = any or T.on(name) end
+    return any
+end
+local function takeOff(o, any)
+    local keep = false
+    for _, name in ipairs(o.keep) do keep = keep or T.on(name) or (name == "game" and any) end
+    if not keep then o.event.Remove(o.fn) end
+end
+function T.offInGame(event, fn, ...)
+    local o = {event = event, fn = fn, keep = {...}}
+    -- (a file run again in a game that has started - the DEV reloader: off at once, as it was
+    -- at the start; otherwise its handler would be back. 2026-11-10)
+    if T.gameStarted then takeOff(o, anyGameModule()) return end
+    table.insert(offInGame, o)
+end
+Events.OnGameStart.Add(function()
+    T.gameStarted = true
+    local any = anyGameModule()
+    for _, o in ipairs(offInGame) do takeOff(o, any) end
+    offInGame = {}
+end)
+
+--- Is the switch as the player left it (which may differ from what runs until the Lua reloads)?
+function T.moduleSaved(name)
+    return T.settings["module." .. name] ~= "0"
+end
+
+function T.setModule(name, on)
+    T.settings["module." .. name] = on and "1" or "0"
+end
+
+-- Look of the inventory screen, the player's to set (the settings window's sliders):
+--   look.all    the master: 0..100 %, multiplies every opacity below (0 = nothing but the
+--               tiles, frames and text is left)
+--   look.bg     how solid the background is: the veil over the world, the columns' panels,
+--               the top and bottom bars, the lists and section headers
+--   look.grid   how solid the grids are: the cells' own background, and with it how strong
+--               the grid's lines are (they never go below a third)
+--   look.line   how thick the grid's lines are, 1..4 px
+--   look.slot   how solid the slots are: equipment, hands, back, quick slots
+--   look.model  how solid the box behind the 3D character is
+-- All at 100 % and 1 px is the look as designed. Tiles, frames and text stay as they are.
+T.LOOK = {
+    {key = "look.all", min = 0, max = 100, step = 5, default = 100, unit = "%"},
+    {key = "look.bg", min = 0, max = 100, step = 5, default = 100, unit = "%"},
+    {key = "look.grid", min = 0, max = 100, step = 5, default = 100, unit = "%"},
+    {key = "look.line", min = 1, max = 4, step = 1, default = 1, unit = " px"},
+    {key = "look.slot", min = 0, max = 100, step = 5, default = 100, unit = "%"},
+    {key = "look.model", min = 0, max = 100, step = 5, default = 100, unit = "%"},
+    -- not a look: how long the search of a container takes, of the time it was made
+    -- with (KnoxSearch) - asked for by a player, 2026-10-13
+    {key = "search.time", min = 25, max = 400, step = 25, default = 100, unit = "%", page = "game"},
+    -- how loud the search is: the hands in the container, each thing found (KnoxSearchSound; 0 = silent)
+    {key = "search.sound", min = 0, max = 200, step = 10, default = 100, unit = "%", page = "game"},
+    -- how loud handling things is: lifted, put down, turned, a bag's window (KnoxUISound; 0 = silent)
+    {key = "ui.sound", min = 0, max = 200, step = 10, default = 100, unit = "%", page = "game"},
+    -- how many cells bags and pockets have, of Knox's own (KnoxFootprint.gridScale; the
+    -- third most common complaint, "too little room" - 2026-10-19)
+    {key = "grid.scale", min = 50, max = 200, step = 10, default = 100, unit = "%", page = "game"},
+    -- how loud the other players' own music is, heard from their cars (KnoxMusicNet)
+    {key = "music.others", min = 0, max = 200, step = 10, default = 70, unit = "%", page = "game"},
+    -- the custom skin's main colour (KnoxTheme skins; drawn in the settings' skin block)
+    {key = "skin.hue", min = 0, max = 355, step = 5, default = 45, unit = "", page = "skin"},
+    {key = "skin.sat", min = 0, max = 100, step = 5, default = 45, unit = "%", page = "skin"},
+    {key = "skin.val", min = 30, max = 100, step = 5, default = 85, unit = "%", page = "skin"},
+    -- the hotbar outside the inventory: its opacity, and how long it stays up with nothing
+    -- happening before it hides (with "hotbar.hide" on; KnoxHotbar - the author, 2026-11-10)
+    {key = "hotbar.alpha", min = 20, max = 100, step = 5, default = 100, unit = "%"},
+    {key = "hotbar.hideTime", min = 1, max = 30, step = 1, default = 5, unit = ""},
+    -- vp.scale  the size of Knox's crosshair panel, Viewpoint's Loot Menu (KnoxCrosshair sizes:
+    --           its rows, pictures, keys and letters; the author, 2026-11-13) - listed only with
+    --           Viewpoint's panel here; new: marked so in the settings
+    {key = "vp.scale", min = 60, max = 160, step = 10, default = 100, unit = "%", page = "game", new = true, only = "viewpoint"},
+}
+
+-- (by key: T.look is asked many times a frame - every grid, panel and slot's alpha)
+local LOOK_BY_KEY = {}
+for _, s in ipairs(T.LOOK) do LOOK_BY_KEY[s.key] = s end
+
+function T.look(key)
+    local s = LOOK_BY_KEY[key]
+    if not s then return 0 end
+    local v = tonumber(T.settings[key])
+    if not v then return s.default end
+    return math.max(s.min, math.min(s.max, math.floor(v + 0.5)))
+end
+
+-- Animations of the inventory (tiles settling, grids unrolling, bars and hints
+-- easing): on unless the player switched them off in the settings. Every one
+-- of them passes its progress (0..1, or its easing step) through T.anim: with
+-- the animations off it is done at once.
+function T.animOn() return T.settings["anim"] ~= "0" end
+
+function T.anim(t)
+    if T.settings["anim"] == "0" then return 1 end
+    return t
+end
+
+--- Where a scrolled panel's grids go on past its edge, they fade into the column
+--- instead of being cut off: a soft band at the bottom while there is more below,
+--- at the top while there is more above; each comes and goes smoothly. `ui` keeps
+--- its state (fadeTop, fadeBottom); `contentH` its content's height; x0, w the
+--- band's left and width; `dt` ms since the last frame. Drawn in its render, over
+--- what it holds. (The inventory column's, then the Surroundings' grid too - the
+--- author, 2026-10-22.)
+function T.edgeFades(ui, contentH, x0, w, dt)
+    local h = ui:getHeight()
+    local ys = ui:getYScroll()
+    local below = contentH + ys - h > 1
+    local above = ys < -1
+    local step = T.anim(math.min(1, dt / 120))
+    ui.fadeBottom = (ui.fadeBottom or 0) + ((below and 1 or 0) - (ui.fadeBottom or 0)) * step
+    ui.fadeTop = (ui.fadeTop or 0) + ((above and 1 or 0) - (ui.fadeTop or 0)) * step
+    if ui.fadeBottom <= 0.01 and ui.fadeTop <= 0.01 then return end
+    local band = math.floor(T.cell * 1.3)
+    local c = T.color.window
+    local strip = 2
+    for i = 0, band - 1, strip do
+        -- (eased: nearly clear where it starts, nearly the column's own colour at the edge)
+        local f = 1 - i / band
+        local a = f * f * 0.95
+        if ui.fadeBottom > 0.01 then
+            ui:drawRect(x0, h - i - strip - ys, w, strip, a * ui.fadeBottom, c.r, c.g, c.b)
+        end
+        if ui.fadeTop > 0.01 then
+            ui:drawRect(x0, i - ys, w, strip, a * ui.fadeTop, c.r, c.g, c.b)
+        end
+    end
+end
+
+-- Switches of the inventory in the settings (they work at once). `page`: the
+-- settings' page a switch or a slider of T.LOOK is on - "look" unless said, or
+-- "game" for what changes how the inventory plays, not how it looks:
+--   anim    the animations above
+--   search  containers not looked into yet are searched, thing by thing (KnoxSearch)
+--   news    the news cards in the main menu's corner (Bazusa and others, 2026-10-19:
+--           "they cover the third hero"); the news page in the screen stays
+T.SWITCHES = {
+    {key = "anim", default = true},
+    {key = "news", default = true},
+    -- barHigh  the winter bar in the menu at its best: the shafts of light in the air, the
+    --          motes, the AO, soft shadows, smooth edges (KnoxBarFrame; the author, 2026-10-31)
+    {key = "barHigh", default = true, page = "menu"},
+    {key = "search", default = false, page = "game"},
+    -- scatter  things found in furniture, cars and bodies lie at random places, not
+    --          packed in rows (KnoxGrid.build; the author, 2026-10-19)
+    {key = "scatter", default = true, page = "game"},
+    -- home  a thing the game takes out of a bag (into a hand, to eat, wear, hang on the belt)
+    --       goes back to its place when let go; while in a hand or in use its place waits
+    --       for it, a grey silhouette in it (KnoxHome; the author, 2026-11-07)
+    {key = "home", default = true, page = "game"},
+    -- grid.free  no limit of cells: every grid one plain grid that grows down with the things,
+    --            only the game's weight limits (KnoxGrid.free; the author, 2026-11-15)
+    {key = "grid.free", default = false, page = "game"},
+    -- musicShare  one's own music in the car heard by the players near it, in a game
+    --             with others (KnoxMusicNet: only its hash, size and kind go out)
+    -- musicHear   the others' own music heard here (and fetched when not here)
+    {key = "musicShare", default = true, page = "game"},
+    {key = "musicHear", default = true, page = "game"},
+    -- vp.panel  Knox's own crosshair panel in place of Viewpoint's (KnoxCrosshair;
+    --           the author, 2026-10-25) - listed only with Viewpoint here
+    {key = "vp.panel", default = true, page = "game", only = "viewpoint"},
+    -- hotbar.hide  the hotbar outside the inventory hides while nothing happens to it and comes
+    --              up when the things in hand change, the mouse comes to its place, the interact
+    --              key is pressed for nothing (KnoxHotbar; the author, 2026-11-10)
+    {key = "hotbar.hide", default = false},
+    -- health.games  every treatment of the Health tab a mini-game on the wound, played well
+    --               done sooner (KnoxHealthGames; the author, 2026-11-10) - listed only with
+    --               the health module on
+    {key = "health.games", default = true, page = "game", only = "health"},
+}
+
+-- Choices of the inventory in the settings: one of a few values, shown as a row
+-- of buttons (they work at once).
+--   loot.scope  which containers the Surroundings column lists: "all" around the
+--               character; "opened" - only the one opened (clicked in the world,
+--               Viewpoint's loot key) and the floor; "auto" - "opened" while
+--               Viewpoint's own view is on, else "all" (asked for by players, 2026-10-14);
+--               OldPoint's overhead camera counts as "all": it sees all around and a
+--               body can't be opened with a click (FL, RAGE: "can't open the zombie's
+--               inventory", "containers don't open", 2026-10-20)
+--               Default "all" since 0.9.7: with "auto" Viewpoint players took the
+--               containers gone from the column for a bug (two reports in an hour)
+--   order.rule  how Sort lays a grid out (KnoxOrder): by category zones, tight
+--               by size, by name, by weight
+--   order.auto  where a thing that comes without a place goes: to its place in
+--               the bag's layout (else next to its category), next to its
+--               category, or the first free cell as before 0.9.8
+T.CHOICES = {
+    {key = "loot.scope", values = {"auto", "opened", "all"}, default = "all", page = "game"},
+    {key = "order.rule", values = {"zones", "dense", "name", "weight"}, default = "zones", page = "order"},
+    {key = "order.auto", values = {"layout", "zones", "off"}, default = "layout", page = "order"},
+}
+
+-- (by key: the search's switch is asked for every tile every frame)
+local CHOICE_BY_KEY, SWITCH_BY_KEY = {}, {}
+for _, c in ipairs(T.CHOICES) do CHOICE_BY_KEY[c.key] = c end
+for _, s in ipairs(T.SWITCHES) do SWITCH_BY_KEY[s.key] = s end
+
+function T.choice(key)
+    local c = CHOICE_BY_KEY[key]
+    if not c then return nil end
+    local v = T.settings[key]
+    for _, ok in ipairs(c.values) do
+        if v == ok then return v end
+    end
+    return c.default
+end
+
+function T.switch(key)
+    local v = T.settings[key]
+    if v == "0" then return false end
+    if v == "1" then return true end
+    local s = SWITCH_BY_KEY[key]
+    if s then return s.default end
+    return false
+end
+
+local function part(key) return T.look("look.all") * T.look(key) / 10000 end
+function T.bgAlpha() return part("look.bg") end
+function T.gridAlpha() return part("look.grid") end
+function T.gridLineAlpha() return 0.34 + 0.66 * T.gridAlpha() end
+function T.gridLine() return T.look("look.line") end
+function T.slotAlpha() return part("look.slot") end
+function T.modelAlpha() return part("look.model") end
+
+local function hex(s)
+    return {
+        r = tonumber(s:sub(2, 3), 16) / 255,
+        g = tonumber(s:sub(4, 5), 16) / 255,
+        b = tonumber(s:sub(6, 7), 16) / 255,
+    }
+end
+
+T.color = {
+    window   = hex("#121414"),
+    header   = hex("#1a1d1d"),
+    border   = hex("#2a2e2e"),
+    cell     = hex("#0e1010"),
+    line     = hex("#242828"),
+    tileEdge = hex("#3c4141"),
+    hoverEdge = hex("#6a6f6a"),
+    tileFrame = hex("#5b615c"),   -- 2 px frame of an item tile, lighter than the grid lines
+    tileHover = hex("#8e938a"),
+    liquid   = hex("#6fa3d8"),   -- liquid in a container (tile meter)
+    text     = hex("#d9d6c8"),
+    bright   = hex("#ece8d8"),
+    dim      = hex("#8f9289"),
+    accent   = hex("#d4c38a"),
+    ok       = hex("#6ca050"),
+    bad      = hex("#be463c"),
+    badText  = hex("#e06c5e"),   -- bad as small text on a header ("Jammed": #be463c read 3.3:1 - the critic, 2026-10-30)
+    fits     = hex("#8fd16a"),   -- T.fits: what fits the hovered thing, light enough over a weapon's green tile (2026-10-30)
+    good     = hex("#9fb36a"),
+    warn     = hex("#c9a24a"),
+    buttonBg = hex("#1f2323"),
+    ink      = hex("#141414"),   -- text on sand
+    screen   = hex("#0b0c0c"),   -- the backdrop under the whole Knox screen
+    lit      = hex("#e6ddb8"),   -- a dim caption lit from behind (the generator's panel while it runs)
+    digit    = hex("#f2ecd8"),   -- the figures of a mechanical counter
+}
+
+-- Skins (beta, 2026-10-15: the author's wish) --------------------------------------
+-- A skin repaints the palette above in place: the main colour (sand by default)
+-- and the dark tones of windows, grids and text. The categories' colours, the
+-- liquid, good / bad / warn stay - they say what a thing is or how it is. Every
+-- part of the mod reads T.color as it draws, so a skin shows at once.
+--   skin       one of T.SKINS' ids, or "custom"
+--   skin.hue / skin.sat / skin.val   the main colour of "custom" (0..359, %, %)
+
+local BASE = {}
+for k, c in pairs(T.color) do BASE[k] = {r = c.r, g = c.g, b = c.b} end
+
+T.SKINS = {
+    {id = "sand"},
+    -- the second main skin after the sand, the winter bar's (the author, 2026-11-01: this colour,
+    -- worked out as the sand is): the bar's menu wears it (T.skin)
+    {id = "ice", accent = "#8ec5e0", window = "#101317", header = "#171c21", border = "#262e36", cell = "#0b0f12",
+     line = "#20272e", tileEdge = "#37414a", hoverEdge = "#627080", tileFrame = "#535e69", tileHover = "#8794a1",
+     text = "#d0d8de", bright = "#e6edf2", dim = "#87929b", buttonBg = "#1a2026", screen = "#090c0f",
+     ink = "#0c151b", lit = "#bfe0f0", digit = "#e8f4fb"},
+    {id = "blood", accent = "#d8705f", window = "#151111", header = "#1d1616", border = "#2e2424", cell = "#100c0c",
+     line = "#2a2020", tileEdge = "#443838", hoverEdge = "#745e5e", tileFrame = "#634f4f", tileHover = "#9a8380",
+     text = "#ddd2cc", bright = "#f0e6e2", dim = "#978986", buttonBg = "#221a1a", screen = "#0d0909"},
+    {id = "pine", accent = "#b5c278", window = "#111411", header = "#181d18", border = "#273027", cell = "#0c100c",
+     line = "#212821", tileEdge = "#384238", hoverEdge = "#657063", tileFrame = "#566255", tileHover = "#889483",
+     text = "#d3d9c8", bright = "#e7ecdc", dim = "#899282", buttonBg = "#1b221b", screen = "#0a0d0a"},
+    {id = "night", accent = "#86f07e", window = "#070d07", header = "#0c150c", border = "#173017", cell = "#050a05",
+     line = "#122412", tileEdge = "#1f4a1f", hoverEdge = "#3f8a3f", tileFrame = "#2f6a2f", tileHover = "#5fb35f",
+     text = "#a8f0a0", bright = "#d0ffc8", dim = "#5f9f5a", buttonBg = "#0d1a0d", screen = "#040804"},
+    {id = "coal", accent = "#cfcfcf", window = "#121212", header = "#1a1a1a", border = "#2b2b2b", cell = "#0d0d0d",
+     line = "#242424", tileEdge = "#3e3e3e", hoverEdge = "#6c6c6c", tileFrame = "#5c5c5c", tileHover = "#8f8f8f",
+     text = "#d8d8d8", bright = "#ededed", dim = "#8f8f8f", buttonBg = "#202020", screen = "#0a0a0a"},
+    -- a survival-horror mansion: brass on dark olive (asked for as a Resident Evil
+    -- look by SmokeGod420; the game's name is not ours to use)
+    {id = "mansion", accent = "#d0a24c", window = "#121310", header = "#1a1c17", border = "#2c2f27", cell = "#0d0e0b",
+     line = "#25271f", tileEdge = "#3f4236", hoverEdge = "#6d7160", tileFrame = "#5d6151", tileHover = "#8f937f",
+     text = "#d8d5c2", bright = "#ece8d2", dim = "#8e8f7e", buttonBg = "#1f211b", screen = "#0a0b08"},
+    {id = "custom"},
+}
+
+--- `s` if it is an id of T.SKINS, else the sand.
+local function skinOr(s)
+    for _, sk in ipairs(T.SKINS) do
+        if sk.id == s then return s end
+    end
+    return "sand"
+end
+
+--- The skin the player chose in the settings (what the game itself wears).
+function T.skinChosen()
+    return skinOr(T.settings["skin"])
+end
+
+--- The skin worn now. In the main menu the place has its own - the sand at the camp, the ice in
+--- the bar - for those on one of these two main skins or none chosen; any other skin was picked
+--- for its colour and stays there too (the author, 2026-11-01, left this case to be decided).
+function T.skin()
+    local s = T.settings["skin"]
+    if T.menuSkin and (s == nil or s == "sand" or s == "ice") then s = T.menuSkin end
+    return skinOr(s)
+end
+
+--- A colour from hue (0..359), saturation and value (0..1).
+local function hsv(h, s, v)
+    h = (h % 360) / 60
+    local i = math.floor(h)
+    local f = h - i
+    local p, q, t = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+    local r, g, b
+    if i == 0 then r, g, b = v, t, p elseif i == 1 then r, g, b = q, v, p elseif i == 2 then r, g, b = p, v, t
+    elseif i == 3 then r, g, b = p, q, v elseif i == 4 then r, g, b = t, p, v else r, g, b = v, p, q end
+    return {r = r, g = g, b = b}
+end
+T.hsv = hsv
+
+--- The main colour of the custom skin, from its three sliders.
+function T.customAccent()
+    return hsv(T.look("skin.hue"), T.look("skin.sat") / 100, T.look("skin.val") / 100)
+end
+
+--- Repaint the palette as the chosen skin says (in place: everything holding a
+--- colour table sees the change). Also handed to the Java part (tooltips, the
+--- loading screen), when it has the call.
+function T.applySkin()
+    T.listEpoch = (T.listEpoch or 0) + 1   -- (the ready lists drawn with the old colours: anew)
+    local id = T.skin()
+    local over = {}
+    for _, sk in ipairs(T.SKINS) do
+        if sk.id == id then over = sk end
+    end
+    for k, base in pairs(BASE) do
+        local c = T.color[k]
+        local v = over[k]
+        local src = (type(v) == "string") and hex(v) or base
+        c.r, c.g, c.b = src.r, src.g, src.b
+    end
+    if id == "custom" then
+        local a = T.customAccent()
+        T.color.accent.r, T.color.accent.g, T.color.accent.b = a.r, a.g, a.b
+    end
+    -- the text on a main-colour plate: dark on a light colour, light on a dark one
+    local a = T.color.accent
+    local lum = 0.2126 * a.r + 0.7152 * a.g + 0.0722 * a.b
+    local ink = lum > 0.45 and (over.ink and hex(over.ink) or BASE.ink) or BASE.bright
+    T.color.ink.r, T.color.ink.g, T.color.ink.b = ink.r, ink.g, ink.b
+    if T.cellGlow then T.cellGlow() end
+    if knoxSetPalette then pcall(knoxSetPalette, T.color) end
+    -- the mouse cursor in the skin's main colour (the Java part repaints the arrow)
+    if knoxCursorTint then pcall(knoxCursorTint, a.r, a.g, a.b, id) end
+end
+
+T.category = {
+    wpn  = hex("#322e23"),
+    med  = hex("#422725"),
+    food = hex("#263722"),
+    ammo = hex("#463a22"),
+    tool = hex("#1b343d"),
+    clo  = hex("#242a32"),
+    info = hex("#382732"),
+    mat  = hex("#443123"),
+    misc = hex("#232726"),
+}
+
+-- The category's glow (stack_count.html G3++, the author 2026-11-13: "очень нравится g3++"): the
+-- colour lit behind the thing, deeper towards the edges, its hue kept (not lighter, not into
+-- another colour - both turned down). Each colour gets `hi` (the middle: richer and brighter)
+-- and `lo` (the edge: a little richer, darker); KnoxTiles.java draws lo with a white spot
+-- tinted hi over it. Saturation and darkening as the author turned them down: x1.95 / x1.55
+-- light in the middle, x1.1 / x0.7 at the edge.
+local function hslOf(c)
+    local r, g, b = c.r, c.g, c.b
+    local mx, mn = math.max(r, g, b), math.min(r, g, b)
+    local l = (mx + mn) / 2
+    if mx == mn then return 0, 0, l end
+    local d = mx - mn
+    local s = l > 0.5 and d / (2 - mx - mn) or d / (mx + mn)
+    local h
+    if mx == r then h = (g - b) / d + (g < b and 6 or 0)
+    elseif mx == g then h = (b - r) / d + 2
+    else h = (r - g) / d + 4 end
+    return h * 60, s, l
+end
+
+local function fromHsl(h, s, l)
+    h = h % 360
+    local c = (1 - math.abs(2 * l - 1)) * s
+    local x = c * (1 - math.abs((h / 60) % 2 - 1))
+    local m = l - c / 2
+    local r, g, b
+    if h < 60 then r, g, b = c, x, 0
+    elseif h < 120 then r, g, b = x, c, 0
+    elseif h < 180 then r, g, b = 0, c, x
+    elseif h < 240 then r, g, b = 0, x, c
+    elseif h < 300 then r, g, b = x, 0, c
+    else r, g, b = c, 0, x end
+    -- (as the mockup: each channel to a whole 0..255 step)
+    local function q(v) return math.floor((v + m) * 255 + 0.5) / 255 end
+    return {r = q(r), g = q(g), b = q(b)}
+end
+
+for _, c in pairs(T.category) do
+    local h, s, l = hslOf(c)
+    c.hi = fromHsl(h, math.min(1, s * 1.95), math.min(0.5, l * 1.55))
+    c.lo = fromHsl(h, math.min(1, s * 1.1), l * 0.7)
+end
+
+-- A tile's empty part (a thing at zero, or above its level) glows too, in the skin's cell
+-- grey (empty_glow.html E2, the author 2026-11-14): the cell lighter in the middle (light
+-- x3.6), a little darker at the edge (x0.8). KnoxTiles.java draws it as the category's glow.
+function T.cellGlow()
+    local c = T.color.cell
+    local h, s, l = hslOf(c)
+    c.hi = fromHsl(h, s, math.min(0.5, l * 3.6))
+    c.lo = fromHsl(h, s, l * 0.8)
+end
+T.cellGlow()
+
+local CATEGORY_BY_DISPLAY = {
+    Ammo = "ammo", WeaponPart = "ammo",
+    FirstAid = "med",
+    Food = "food", Water = "food", WaterContainer = "food", Cooking = "food",
+    Tool = "tool", Electronics = "tool", Communications = "tool", LightSource = "tool",
+    VehicleMaintenance = "tool", Gardening = "tool", Fishing = "tool", Trapping = "tool",
+    Clothing = "clo", Container = "clo", Bag = "clo", Accessory = "clo",
+    Literature = "info", SkillBook = "info", Key = "info", Security = "info",
+    Cartography = "info", Memento = "info",
+    Material = "mat", Camping = "mat",
+    Weapon = "wpn", WeaponCrafted = "wpn", Explosives = "wpn",
+}
+
+local function categoryOfType(item, ft)
+    -- the player's own (knox_overrides.txt: "Base.Bleach = category mat")
+    local o = KnoxFootprint and KnoxFootprint.overrides[ft]
+    if o and o.cat then return o.cat end
+    local c = CATEGORY_BY_DISPLAY[item:getDisplayCategory() or ""]
+    if c then return c end
+    if instanceof(item, "HandWeapon") then return "wpn" end
+    if instanceof(item, "Food") then return "food" end
+    if instanceof(item, "Clothing") or instanceof(item, "InventoryContainer") then return "clo" end
+    if instanceof(item, "Literature") or instanceof(item, "Key") then return "info" end
+    return "misc"
+end
+
+-- (kept by type: every tile, slot and quick slot asks it every frame, two to six
+-- calls into the game each, and a type's category is the same for all its things;
+-- made anew when the player's own sizes are read anew - a server's, KnoxFootprint.useOverrides)
+local catCache, catFor = {}, nil
+
+function T.categoryOf(item)
+    local ft = item:getFullType()
+    local overrides = KnoxFootprint and KnoxFootprint.overrides
+    if catFor ~= overrides then catCache, catFor = {}, overrides end
+    local c = catCache[ft]
+    if c then return c end
+    c = categoryOfType(item, ft)
+    catCache[ft] = c
+    return c
+end
+
+-- Fonts -----------------------------------------------------------------------
+-- A font is a handle: one of Knox's own Fira Sans Extra Condensed atlases
+-- {knox = true, style, size, key}, or one of the game's UIFont values (a
+-- language Knox's atlases can't write). Draw and measure text only through
+-- the helpers below, they handle both.
+--   styles: "title" (bold), "body" (medium), "head" (semibold, letter-spaced,
+--   for labels in capitals: tabs, buttons, section titles, tile names)
+
+local function knoxFont(style, size)
+    size = math.max(10, math.min(44, math.floor(size + 0.5)))
+    return {knox = true, style = style, size = size, key = style .. "_" .. size}
+end
+T.makeFont = knoxFont   -- only valid when T.javaFonts
+
+--- A Knox font past the biggest atlas (44 px): the atlas drawn scaled up by Java (KnoxFonts,
+--- jar 154) - the health tab's big number, 78 px in its mockup (the author, 2026-11-10).
+function T.makeBigFont(style, size)
+    size = math.max(10, math.min(120, math.floor(size + 0.5)))
+    return {knox = true, style = style, size = size, key = style .. "_" .. size}
+end
+
+--- Biggest game font (with Cyrillic) not taller than `limit`, for the fallback.
+local function gameFontUpTo(limit)
+    local tm = getTextManager()
+    local best, bestH, smallest, smallestH
+    for _, name in ipairs({"Small", "NewSmall", "Medium", "NewMedium"}) do
+        local f = UIFont[name]
+        if f then
+            local h = tm:getFontHeight(f)
+            if h <= limit and (not bestH or h > bestH) then best, bestH = f, h end
+            if not smallestH or h < smallestH then smallest, smallestH = f, h end
+        end
+    end
+    return best or smallest
+end
+T.gameFontUpTo = gameFontUpTo
+
+--- Can Knox's atlases write the game's language? Checked on a few of the
+--- game's own strings (Knox's are in English for most languages); Chinese,
+--- Japanese, Korean, Thai, Arabic... are not in them.
+local LANGUAGE_PROBES = {"ContextMenu_Drop", "ContextMenu_Wear", "ContextMenu_Equip_Primary",
+                         "Tooltip_item_Weight", "Tooltip_weapon_Condition"}
+local function languageCovered()
+    if not T.active then return false end
+    local parts = {}
+    for _, key in ipairs(LANGUAGE_PROBES) do
+        local s = getTextOrNull(key)
+        if s then table.insert(parts, s) end
+    end
+    return knoxFontCovers(table.concat(parts, " ")) == true
+end
+
+--- Sizes follow the screen: 48 px cells at 1080p, 64 px at 1440p, 96 px at
+--- 2160p; narrow screens (5:4, 4:3) go by width instead, so the three columns
+--- (about 34 cells side by side) still fit. Font sizes follow the cell (at
+--- 48 px: the mockup's 20 / 17 / 15 / 14 / 12 px).
+--- 1280x720: 32, 1366x768: 34, 1280x1024: 37, 1920x1080: 48, 3440x1440: 64.
+function T.refresh()
+    T.listEpoch = (T.listEpoch or 0) + 1   -- (sizes and fonts change: the ready lists anew)
+    local sw, sh = getCore():getScreenWidth(), getCore():getScreenHeight()
+    local byHeight = sh * 48 / 1080
+    local byWidth = (sw - 8) / 34
+    T.cell = math.max(30, math.floor(math.min(byHeight, byWidth) + 0.5))
+    T.pad = math.floor(T.cell / 4)
+    T.gap = math.floor(T.cell / 4)
+
+    local c = T.cell
+    -- the Java part draws Knox's own atlases; if they lack the language's
+    -- letters (or are still loading), the game's fonts are used
+    T.languageOk = languageCovered()
+    T.javaFonts = T.active and T.languageOk and knoxFontReady("body", c * 0.31) == true
+    if T.javaFonts then
+        T.fontHeader = knoxFont("title", c * 0.42)   -- column and window titles
+        T.fontTab = knoxFont("head", c * 0.36)       -- top bar tabs
+        T.fontText = knoxFont("body", c * 0.31)      -- body text, values
+        T.fontCaps = knoxFont("head", c * 0.29)      -- section titles, buttons, labels
+        T.fontTile = knoxFont("head", c * 0.25)      -- tile names, small labels
+        -- a stack's count, a magazine's rounds (stack_count.html R2, the author 2026-11-13):
+        -- bold 12 px at 1080p, its "/ what it holds" smaller
+        T.fontCount = knoxFont("title", c * 0.25)
+        T.fontCountSmall = knoxFont("head", c * 0.21)
+    else
+        T.fontCount, T.fontCountSmall = nil, nil
+        T.fontHeader = UIFont.Medium
+        T.fontTab = UIFont.Medium
+        T.fontText = UIFont.Small
+        T.fontCaps = UIFont.Small
+        T.fontTile = gameFontUpTo(c * 0.32)
+    end
+    T.fontTileH = T.fontH(T.fontTile)
+    T.headerH = T.fontH(T.fontHeader) + T.pad
+    T.sectionH = T.fontH(T.fontCaps) + math.floor(T.pad / 2)
+end
+
+--- Sizes and fonts ready for drawing outside the Knox screen (hotbar, menus,
+--- tooltips). Knox's font atlases load in the background: drawn before they
+--- were ready, the game's fonts were kept until the Knox screen opened, so
+--- this looks again now and then until they are.
+local nextFontCheck = 0
+function T.ensure()
+    if not T.cell then T.refresh() return end
+    if T.javaFonts or not T.languageOk or not T.active then return end
+    local now = getTimestampMs()
+    if now < nextFontCheck then return end
+    nextFontCheck = now + 500
+    if knoxFontReady("body", T.cell * 0.31) == true then T.refresh() end
+end
+
+-- Knox's atlases' heights and widths, kept by atlas: a caption is measured several
+-- times a frame (its band, its plate, its row), each a call into the Java part, and
+-- an atlas's metrics never change once it is read (AngelCodeFont parses its .fnt
+-- when it is made; only its picture loads later). The game's own fonts are asked
+-- each time (the player may change their size).
+local heightOf = {}
+local widthOf, widthN = {}, {}
+local WIDTHS_MAX = 3000   -- texts kept per atlas (item names come and go): let go of beyond
+
+function T.fontH(font)
+    if type(font) == "table" then
+        local h = heightOf[font.key]
+        if not h then
+            h = knoxFontHeight(font.style, font.size)
+            heightOf[font.key] = h
+        end
+        return h
+    end
+    return getTextManager():getFontHeight(font)
+end
+
+function T.measure(font, s)
+    if s == nil or s == "" then return 0 end
+    if type(font) == "table" then
+        local key = font.key
+        local c = widthOf[key]
+        local w = c and c[s]
+        if w then return w end
+        w = knoxTextWidth(font.style, font.size, s)
+        if not c or widthN[key] >= WIDTHS_MAX then
+            c = {}
+            widthOf[key], widthN[key] = c, 0
+        end
+        c[s] = w
+        widthN[key] = widthN[key] + 1
+        return w
+    end
+    return getTextManager():MeasureStringX(font, s)
+end
+
+--- Draw dark text in the very middle of a plate x, y, w, h: by where its
+--- pixels are (the Java part's knoxTextInk), not by the font's width and line
+--- height, which count the spacing after the last letter and the room for
+--- accents and tails - a digit centred by those sits off the middle.
+-- (kept by font and text: every caption asks twice a frame - its own box and a
+-- capital's - each a call into Java and a pattern match; emptied when it grows)
+-- (by font, then by text: a key made of the two was a new string each ask, twice
+-- a caption - 140 captions a frame, the author's FPS task 2026-10-28)
+local inkCache, inkCount = {}, 0   -- font key -> text -> {left, top, right, bottom}
+
+local function inkBox(font, s)
+    if type(font) == "table" and knoxTextInk then
+        local byFont = inkCache[font.key]
+        local box = byFont and byFont[s]
+        if box then return box[1], box[2], box[3], box[4] end
+        local ink = knoxTextInk(font.style, font.size, s)
+        local l, t, r, b = string.match(ink or "", "^(-?%d+),(-?%d+),(-?%d+),(-?%d+)$")
+        if l then
+            -- (5th: the pixel a number starting with "1" goes back - see inkStart)
+            box = {tonumber(l), tonumber(t), tonumber(r), tonumber(b),
+                   (string.byte(s, 1) == 49 and string.find(s, "^%d+$")) and -1 or 0}
+            inkCount = inkCount + 1
+            if inkCount > 4000 then inkCache, inkCount, byFont = {}, 1, nil end
+            if not byFont then
+                byFont = {}
+                inkCache[font.key] = byFont
+            end
+            byFont[s] = box
+            return box[1], box[2], box[3], box[4]
+        end
+    end
+    return 0, 0, T.measure(font, s), T.fontH(font)
+end
+-- (letter by letter captions - the generator's, spaced as its mockup - measure
+-- each letter's pixels themselves: left, top, right, bottom from where it is drawn)
+T.inkBox = inkBox
+
+-- where T.inkCentre starts drawing `s` in the box x, y, w, h
+-- (the boxes taken from the cache as they are when both are in it: some 1.6 us a
+-- caption went on asking for them value by value - offline, the game's Lua, 2026-10-28)
+local function inkStart(s, x, y, w, h, font)
+    local byFont = type(font) == "table" and inkCache[font.key]
+    local box, cap = byFont and byFont[s], byFont and byFont.H
+    -- Up and down by a plain capital's height, whatever the text: letters with a
+    -- tail (Д, Щ, Ц) or a mark (Ё, Й) moved a caption off the line, and a number
+    -- next to it then sat on another level ("НАЙДЕНО 4" - seen 2026-10-14). So
+    -- every caption and number in a bar of the same height stands on one line.
+    -- (a number starting with "1": by its pixels it looks pushed right - the eye
+    -- takes its stem, not its flag, for its middle; a pixel back, as type is set)
+    if box and cap then
+        return x + math.floor((w - (box[3] - box[1])) / 2 + 0.5) - box[1] + box[5],
+            y + math.floor((h - (cap[4] - cap[2])) / 2 + 0.5) - cap[2]
+    end
+    local left, _, right = inkBox(font, s)
+    local _, top, _, bottom = inkBox(font, "H")
+    local tx = x + math.floor((w - (right - left)) / 2 + 0.5) - left
+    local ty = y + math.floor((h - (bottom - top)) / 2 + 0.5) - top
+    if string.byte(s, 1) == 49 and string.find(s, "^%d+$") then tx = tx - 1 end
+    return tx, ty
+end
+
+function T.inkCentre(ui, s, x, y, w, h, r, g, b, a, font)
+    font = font or T.fontCaps
+    local tx, ty = inkStart(s, x, y, w, h, font)
+    if ui == nil then return tx, ty end   -- (asked only where the text would start: T.inkOrigin)
+    T.drawText(ui, s, tx, ty, r, g, b, a, font)
+    if T.layoutDebug() and s ~= "" then T.debugInk(ui, {x, y, w, h}, tx, ty, s, font, true) end
+end
+
+--- Text from x, in the middle of the height h from y by its pixels (a caption
+--- on a bar or a button: by the font's line height capitals sit too high).
+function T.inkLeft(ui, s, x, y, h, c, font, a)
+    font = font or T.fontCaps
+    local tx, ty = T.inkOrigin(s, x, y, T.measure(font, s), h, font)
+    local w = T.measure(font, s)
+    -- (horizontally the text starts at x as usual; only the height is by the ink)
+    T.drawText(ui, s, x, ty, c.r, c.g, c.b, a or 1, font)
+    return w, tx
+end
+
+-- The layout kit -----------------------------------------------------------------
+--
+-- Every caption, number and small framed button goes through these. They put
+-- text in its band by its pixels (the rule of T.inkCentre) and draw the framed
+-- square buttons one way, so a new piece stands right by construction and no
+-- text is centred by hand (the author, 2026-10-20: every new thing needed
+-- checking whether its text sat in the middle and its margins matched).
+--   T.label(ui, s, r, c, opts)       text in a band r = {x, y, w, h}
+--   T.plate(ui, r, s, opts)          a plate with its text in the middle
+--   T.iconButton(ui, r, glyph, hot)  the framed square of a header (fold, close...)
+-- tools/uilint flags centring by hand in new code. The "Layout" overlay
+-- (DEV panel, or dev.layout=1 in knox_settings.txt) shows each band and where
+-- its letters are, red where they are off the middle.
+
+--- Is the "Layout" overlay on?
+function T.layoutDebug()
+    return T.settings["dev.layout"] == "1"
+end
+
+function T.setLayoutDebug(on)
+    T.settings["dev.layout"] = on and "1" or nil
+    T.saveSettings()
+end
+
+--- (the overlay over one piece of text: its band in blue, its letters' box in
+--- violet - red when centred and more than a pixel off the band's middle)
+function T.debugInk(ui, r, tx, ty, s, font, centred)
+    local left, top, right, bottom = inkBox(font, s)
+    local _, capTop, _, capBottom = inkBox(font, "H")
+    local ix, iy, iw = tx + left, ty + capTop, right - left
+    local ih = capBottom - capTop
+    local off = math.abs((iy + ih / 2) - (r[2] + r[4] / 2)) > 1
+    if centred then off = off or math.abs((ix + iw / 2) - (r[1] + r[3] / 2)) > 1 end
+    ui:drawRectBorder(r[1], r[2], r[3], r[4], 0.8, 0.2, 0.7, 1)
+    if off then
+        ui:drawRectBorder(ix, iy, iw, ih, 1, 1, 0.15, 0.15)
+    else
+        ui:drawRectBorder(ix, iy, iw, ih, 0.8, 0.85, 0.3, 0.9)
+    end
+end
+
+--- Text in the band r = {x, y, w, h}: up and down by a capital's pixels;
+--- opts.align "left" (default: starts at x), "right" (ends at x + w) or
+--- "centre" (by its pixels). opts.font (T.fontCaps), opts.a. Returns its width.
+local NO_OPTS = {}   -- (T.label only reads its options: none given, no table made each call)
+
+function T.label(ui, s, r, c, opts)
+    opts = opts or NO_OPTS
+    local font = opts.font or T.fontCaps
+    local align = opts.align or "left"
+    s = s or ""
+    local w = T.measure(font, s)
+    local tx, ty
+    if align == "centre" then
+        tx, ty = T.inkOrigin(s, r[1], r[2], r[3], r[4], font)
+    else
+        local _, oy = T.inkOrigin(s, r[1], r[2], w, r[4], font)
+        tx, ty = align == "right" and (r[1] + r[3] - w) or r[1], oy
+    end
+    T.drawText(ui, s, tx, ty, c.r, c.g, c.b, opts.a or 1, font)
+    if T.layoutDebug() and s ~= "" then T.debugInk(ui, r, tx, ty, s, font, align == "centre") end
+    return w
+end
+
+-- (the options handed on to T.label by the kit's own pieces: filled in, not made
+-- anew - they are drawn every frame, and T.label only reads them)
+local plateOpts = {align = "centre"}
+local buttonOpts = {align = "centre"}
+local hintPlate, hintPlateOpts = {0, 0, 0, 0}, {}
+local hintBand, hintBandOpts = {0, 0, 0, 0}, {}
+
+--- A plate r with `s` in its middle. opts: fill (a color; none: not filled),
+--- edge (a color for a 1 px frame), thick (true: the frame 2 px), color (the
+--- text's: T.color.text), font, a.
+function T.plate(ui, r, s, opts)
+    opts = opts or {}
+    local a = opts.a or 1
+    if opts.fill then T.rect(ui, r[1], r[2], r[3], r[4], opts.fill, a) end
+    if opts.edge then
+        if opts.thick then T.tileFrame(ui, r[1], r[2], r[3], r[4], opts.edge, a) else T.border(ui, r[1], r[2], r[3], r[4], opts.edge, a) end
+    end
+    if s and s ~= "" then
+        plateOpts.font, plateOpts.a = opts.font, a
+        T.label(ui, s, r, opts.color or T.color.text, plateOpts)
+    end
+end
+
+--- Text spaced out letter by letter (the mockup's letter-spacing: `ls` px more after each
+--- letter) in the band r = {x, y, w, h}: up and down by a capital's pixels, sideways by
+--- its own pixels (the spacing after the last letter not counted) - opts.align "centre"
+--- (default) or "left". opts.font, opts.a. Laid out once per font, text and spacing.
+--- (the pinned post's head and the roadmap's title, 2026-10-25)
+local spacedCache, spacedN = {}, 0
+local function spacedLayout(font, s, ls)
+    local key = (type(font) == "table" and font.key or tostring(font)) .. "|" .. ls .. "|" .. s
+    local L = spacedCache[key]
+    if L then return L end
+    L = {chars = {}, xs = {}}
+    -- (a letter goes where the text before it ends: the font measures to the last letter's
+    -- ink, so a space alone measured 0 and was lost, and letters measured one by one sat
+    -- unevenly - "ЧТОВЫСKNOX", "СПА СИБО", the author 2026-10-25; "H" after the text
+    -- measures it to its advance)
+    local hW = T.measure(font, "H")
+    for i = 1, string.len(s) do
+        L.chars[i] = string.sub(s, i, i)
+        L.xs[i] = (i > 1 and (T.measure(font, string.sub(s, 1, i - 1) .. "H") - hW) or 0) + ls * (i - 1)
+    end
+    local n = #L.chars
+    L.left, L.right = 0, 0
+    if n > 0 then
+        local l1 = inkBox(font, L.chars[1])
+        local _, _, rn = inkBox(font, L.chars[n])
+        L.left, L.right = L.xs[1] + l1, L.xs[n] + rn
+    end
+    spacedN = spacedN + 1
+    if spacedN > 400 then spacedCache, spacedN = {}, 1 end
+    spacedCache[key] = L
+    return L
+end
+
+function T.spaced(ui, s, r, c, opts)
+    local font = opts and opts.font or T.fontCaps
+    local ls = opts and opts.ls or 0
+    local a = opts and opts.a or 1
+    local L = spacedLayout(font, s or "", ls)
+    local _, top, _, bottom = inkBox(font, "H")
+    local ty = r[2] + math.floor((r[4] - (bottom - top)) / 2 + 0.5) - top
+    local tx = r[1] - L.left
+    if not (opts and opts.align == "left") then tx = r[1] + math.floor((r[3] - (L.right - L.left)) / 2 + 0.5) - L.left end
+    for i = 1, #L.chars do
+        T.drawText(ui, L.chars[i], tx + L.xs[i], ty, c.r, c.g, c.b, a, font)
+    end
+    return L.right - L.left
+end
+
+--- Width of a plate for `s`: its text and a pad and a half each side.
+function T.plateW(s, font)
+    return T.measure(font or T.fontCaps, s or "") + math.floor(T.pad * 1.5) * 2
+end
+
+--- The framed square button of a header r = {x, y, s, s}: grey frame, sand
+--- under the mouse (`hot`); glyph "down", "up", "right", "left" (an angle of
+--- 2 px dots) or "close" (the cross). opts.off: dimmed.
+function T.iconButton(ui, r, glyph, hot, opts)
+    local off = opts and opts.off
+    if glyph == "close" then return T.closeButton(ui, r[1], r[2], r[3], hot and not off) end
+    local on = hot and not off
+    T.border(ui, r[1], r[2], r[3], r[4], on and T.color.accent or T.color.tileEdge)
+    local c = off and T.color.dim or (on and T.color.accent or T.color.text)
+    local cs = math.max(2, math.floor(r[3] / 5))
+    -- the chevron's whole block (2 px squares: 2cs + 2 across, cs + 2 deep) in the middle of the
+    -- button - set by its middle pixel, the squares growing right and down, it stood 1 px right
+    -- and 1.5 px low (the critic 2026-11-15, the author: "поправить")
+    local long, deep = cs * 2 + 2, cs + 2
+    local across = glyph == "down" or glyph == "up"
+    local x0 = r[1] + math.floor((r[3] - (across and long or deep)) / 2)
+    local y0 = r[2] + math.floor((r[4] - (across and deep or long)) / 2)
+    for i = 0, cs do
+        if glyph == "down" then
+            ui:drawRect(x0 + i, y0 + i, 2, 2, 1, c.r, c.g, c.b)
+            ui:drawRect(x0 + cs * 2 - i, y0 + i, 2, 2, 1, c.r, c.g, c.b)
+        elseif glyph == "up" then
+            ui:drawRect(x0 + i, y0 + cs - i, 2, 2, 1, c.r, c.g, c.b)
+            ui:drawRect(x0 + cs * 2 - i, y0 + cs - i, 2, 2, 1, c.r, c.g, c.b)
+        elseif glyph == "right" then
+            ui:drawRect(x0 + i, y0 + i, 2, 2, 1, c.r, c.g, c.b)
+            ui:drawRect(x0 + i, y0 + cs * 2 - i, 2, 2, 1, c.r, c.g, c.b)
+        else   -- left
+            ui:drawRect(x0 + cs - i, y0 + i, 2, 2, 1, c.r, c.g, c.b)
+            ui:drawRect(x0 + cs - i, y0 + cs * 2 - i, 2, 2, 1, c.r, c.g, c.b)
+        end
+    end
+end
+
+--- The margin of the things in a bar of height h (plates, buttons, the close
+--- cross): the same above, below, at the right end and between them. A fifth
+--- of the bar (4 px flat looked cramped - seen in game 2026-10-14).
+function T.barMargin(h)
+    return math.max(5, math.floor(h * 0.2 + 0.5))
+end
+
+--- Width of a count plate for `text` in a bar of height h.
+function T.countPlateW(text, h)
+    local bh = h - T.barMargin(h) * 2
+    return math.max(bh, T.measure(T.fontCaps, text) + math.floor(bh * 0.6))
+end
+
+--- A count on a small plate in a bar (a header, a button): sand with a dark
+--- number when `on`, grey with a dim one when not. The bar's margin above and
+--- below it (T.barMargin), its right edge at `right` (the caller leaves the
+--- margin to the next thing). `st`: a table kept with the plate (the number
+--- rolls when it changes). `inset`: so many pixels less above and below (next
+--- to framed buttons of the bar's height a solid plate looks taller). Returns
+--- the plate's left x.
+function T.countPlate(ui, st, text, right, y, h, on, inset, a)
+    local f = T.fontCaps
+    a = a or 1
+    local m = T.barMargin(h) + (inset or 0)
+    local bh = h - m * 2
+    local bw = math.max(bh, T.countPlateW(text, h) - (inset or 0) * 2)
+    local bx, by = right - bw, y + m
+    T.rect(ui, bx, by, bw, bh, on and T.color.accent or T.color.tileEdge, a)
+    if on then
+        T.rollNumber(ui, st, text, bx, by, bw, bh, 0.08, 0.08, 0.08, a, f)
+    else
+        st.text = text
+        local c = T.color.dim
+        T.inkCentre(ui, text, bx, by, bw, bh, c.r, c.g, c.b, a, f)
+    end
+    return bx
+end
+--- Where T.inkCentre would start drawing `s` in the box: x, y.
+function T.inkOrigin(s, x, y, w, h, font)
+    return inkStart(s, x, y, w, h, font or T.fontCaps)
+end
+
+--- A capital's height in pixels (what goes under a name is placed by it).
+function T.capH(font)
+    local _, top, _, bottom = inkBox(font, "H")
+    return bottom - top
+end
+
+--- A number on a plate that rolls when it changes, as the clock's digits do:
+--- a digit that changed goes up and out, the new one comes up from under it,
+--- the rest stand still (a number of another length rolls whole). `st`: a table
+--- kept with the plate - it remembers the number shown before.
+function T.rollNumber(ui, st, s, x, y, w, h, r, g, b, a, font)
+    font = font or T.fontCaps
+    local now = getTimestampMs()
+    if st.text ~= s then
+        st.old, st.rollMs = st.text, now
+        st.text = s
+    end
+    local old = st.old
+    local t = (old and old ~= "") and T.anim((now - (st.rollMs or 0)) / 180) or 1
+    if t >= 1 or s == "" then
+        if s ~= "" then T.inkCentre(ui, s, x, y, w, h, r, g, b, a, font) end
+        return
+    end
+    local k = 1 - (1 - t) * (1 - t)
+    local rise = math.floor(h * 0.42)
+    local up, down = -math.floor(rise * k + 0.5), math.floor(rise * (1 - k) + 0.5)
+    if #old ~= #s then
+        T.inkCentre(ui, old, x, y + up, w, h, r, g, b, a * (1 - k), font)
+        T.inkCentre(ui, s, x, y + down, w, h, r, g, b, a * k, font)
+        return
+    end
+    local tx, ty = T.inkOrigin(s, x, y, w, h, font)
+    for i = 1, #s do
+        local ch, was = string.sub(s, i, i), string.sub(old, i, i)
+        local cx = tx + T.measure(font, string.sub(s, 1, i - 1))
+        if ch == was then
+            T.drawText(ui, ch, cx, ty, r, g, b, a, font)
+        else
+            T.drawText(ui, was, cx, ty + up, r, g, b, a * (1 - k), font)
+            T.drawText(ui, ch, cx, ty + down, r, g, b, a * k, font)
+        end
+    end
+end
+--- Draw text at x,y of element `ui` (same arguments as ISUIElement:drawText).
+function T.drawText(ui, s, x, y, r, g, b, a, font)
+    local jo = ui.javaObject
+    if s == nil or not jo then return end
+    font = font or T.fontText
+    if type(font) == "table" then
+        -- (where the element is, asked of its Java object straight: ISUIElement's
+        -- getAbsoluteX and the rest are a Lua call each round the same - 140 texts
+        -- a frame, the author's FPS task 2026-10-28; none of Knox's drawn-on
+        -- elements has them of its own)
+        knoxDrawText(font.style, font.size, s, jo:getAbsoluteX() + x + jo:getXScroll(),
+            jo:getAbsoluteY() + y + jo:getYScroll(), r, g, b, a)
+    else
+        ui:drawText(s, x, y, r, g, b, a, font)
+    end
+end
+
+-- Ready lists (the inventory's FPS, stage 1 - the author, 2026-10-28): a part of a
+-- window that looks the same frame after frame is drawn from Lua once, while Java
+-- (KnoxDrawList) writes down what it drew, and is drawn again by Java alone until
+-- its key changes - everything the part shows hangs on: what it says, where, what is
+-- under the mouse. Use:
+--     if not T.listDraw(self, L, k1, k2, k3, k4, k5) then   -- (up to k8: a slot's, 2026-10-29)
+--         ...draw the part as ever...
+--         T.listEnd(L)
+--     end
+-- (L = T.newList() once per part - and for good: Java keeps every list, so a window
+-- made anew takes the same ones; keys are compared with ==, so numbers, strings,
+-- booleans and the same tables). Drawn by Lua as before: an older jar, the settings
+-- window open (its sliders change the look under it), a list Java could not play
+-- back the same three times running (KnoxDrawList counts the sprites), and while
+-- T.listsOff is set (the bench's auto measure: the old way and the new one, side by side).
+T.listEpoch = T.listEpoch or 0
+local listCount = 0
+
+function T.newList()
+    listCount = listCount + 1
+    return {id = listCount, fails = 0}
+end
+
+--- Are the ready lists drawn now? (the jar has them, the settings window is shut,
+--- T.listsOff not set)
+function T.listsOn()
+    return not T.listsOff and knoxListDraw ~= nil and not (KnoxSettings and KnoxSettings.instance)
+end
+
+function T.listDraw(ui, L, k1, k2, k3, k4, k5, k6, k7, k8)
+    L.writing = false
+    if L.dead or not T.listsOn() then
+        L.ok = false
+        return false
+    end
+    local jo = ui.javaObject
+    if L.ok and L.ui == ui and L.epoch == T.listEpoch and L.k1 == k1 and L.k2 == k2 and L.k3 == k3
+            and L.k4 == k4 and L.k5 == k5 and L.k6 == k6 and L.k7 == k7 and L.k8 == k8 then
+        local drawn = knoxListDraw(jo, L.id)
+        if drawn == 2 then L.fails = 0 end
+        if drawn > 0 then return true end
+        L.fails = L.fails + 1
+        if L.fails >= 3 then
+            L.dead, L.ok = true, false
+            print("[Knox] ready list " .. L.id .. ": not the same when played back, drawn from Lua from now on")
+            return false
+        end
+    end
+    L.ok = false
+    L.ui, L.epoch, L.k1, L.k2, L.k3, L.k4, L.k5 = ui, T.listEpoch, k1, k2, k3, k4, k5
+    L.k6, L.k7, L.k8 = k6, k7, k8
+    knoxListBegin(jo, L.id)
+    L.writing = true
+    return false
+end
+
+function T.listEnd(L)
+    if not L.writing then return end
+    L.writing = false
+    L.ok = knoxListEnd()
+end
+
+function T.drawTextRight(ui, s, x, y, r, g, b, a, font)
+    T.drawText(ui, s, x - T.measure(font or T.fontText, s), y, r, g, b, a, font)
+end
+
+function T.drawTextCentre(ui, s, x, y, r, g, b, a, font)   -- uilint: ok (old code; new: T.label)
+    T.drawText(ui, s, x - math.floor(T.measure(font or T.fontText, s) / 2), y, r, g, b, a, font)
+end
+
+-- Upper case, Cyrillic included. Labels in capitals: tabs, buttons, section
+-- titles, tile names. Kahlua strings are Java strings (one character per
+-- string.byte code); Cyrillic is shifted by hand in case string.upper leaves it.
+-- (the text caches below are emptied when they grow large: item names, widths)
+local CACHE_MAX = 4000
+local upperCache, upperCount = {}, 0
+
+function T.upper(s)
+    if s == nil then return s end
+    local hit = upperCache[s]
+    if hit then return hit end
+    upperCount = upperCount + 1
+    if upperCount > CACHE_MAX then upperCache, upperCount = {}, 1 end
+    local src = string.upper(s)
+    local parts = {}
+    for i = 1, string.len(src) do
+        local b = string.byte(src, i)
+        if b >= 1072 and b <= 1103 then b = b - 32          -- а..я
+        elseif b >= 1104 and b <= 1119 then b = b - 80 end  -- ѐ..џ (ё, є, і, ї, ў)
+        parts[i] = string.char(b)
+    end
+    local out = table.concat(parts)
+    upperCache[s] = out
+    return out
+end
+
+-- Lower case, Cyrillic included (searching item names: "Бинт" is found by "бинт").
+local lowerCache, lowerCount = {}, 0
+
+function T.lower(s)
+    if s == nil then return s end
+    local hit = lowerCache[s]
+    if hit then return hit end
+    lowerCount = lowerCount + 1
+    if lowerCount > CACHE_MAX then lowerCache, lowerCount = {}, 1 end
+    local src = string.lower(s)
+    local parts = {}
+    for i = 1, string.len(src) do
+        local b = string.byte(src, i)
+        if b >= 1040 and b <= 1071 then b = b + 32          -- А..Я
+        elseif b >= 1024 and b <= 1039 then b = b + 80 end  -- Ѐ..Џ (Ё, Є, І, Ї, Ў)
+        parts[i] = string.char(b)
+    end
+    local out = table.concat(parts)
+    lowerCache[s] = out
+    return out
+end
+-- Drawing helpers -----------------------------------------------------------
+
+function T.rect(ui, x, y, w, h, c, a)
+    ui:drawRect(x, y, w, h, a or 1, c.r, c.g, c.b)
+end
+
+function T.border(ui, x, y, w, h, c, a)
+    ui:drawRectBorder(x, y, w, h, a or 1, c.r, c.g, c.b)
+end
+
+--- Frame of an item tile or a filled slot: 2 px, `c` (default T.color.tileFrame).
+--- (four 2 px bands, the same pixels as two 1 px frames: half the draws - it
+--- is drawn for every tile every frame)
+function T.tileFrame(ui, x, y, w, h, c, a)
+    c = c or T.color.tileFrame
+    a = a or 1
+    ui:drawRect(x, y, w, 2, a, c.r, c.g, c.b)
+    ui:drawRect(x, y + h - 2, w, 2, a, c.r, c.g, c.b)
+    ui:drawRect(x, y + 2, 2, h - 4, a, c.r, c.g, c.b)
+    ui:drawRect(x + w - 2, y + 2, 2, h - 4, a, c.r, c.g, c.b)
+end
+
+-- The frost in the winter bar's menu (the author, 2026-11-01): under the mouse the edge of the
+-- main menu's item on the left (KnoxMenuNews) cracks with the cold - chips out of it where cracks
+-- start, thin cracks running in in jerks; the mouse gone, they fade. Those items only: not the
+-- radio's card, not any other button (the author). Only with T.barLook on and animations on. The cracks are made once (FROST_KINDS kinds, each a few roots round the edge);
+-- each frame only what has grown is drawn, for the one or two concerned.
+local FROST_KINDS, FROST_ROOTS = 6, 3
+local FROST_GROW, FROST_FADE = 0.32, 0.28   -- s
+local FROST_JERKS = 7
+local FROST_WIDE = 200      -- px: a wider one has cracks of three kinds at once (9 roots, not 3)
+local frostKinds, frostNext = nil, 1
+local frostState = {}
+
+local function frostMake()
+    frostKinds = {}
+    local seed = 4217
+    local function rnd(n)
+        seed = (seed * 75 + 74) % 65537
+        return seed % n
+    end
+    for k = 1, FROST_KINDS do
+        local roots = {}
+        for r = 1, FROST_ROOTS do
+            -- (round the frame, each root in its own third: not all in one corner)
+            local root = {p = ((r - 1) + 0.15 + rnd(70) / 100) / FROST_ROOTS, a = {}, d = {}, t = {}, n = 0}
+            local function run(al, dp, len, start, lean)
+                for i = 1, len do
+                    if rnd(4) > 0 then dp = dp + 1 end
+                    if rnd(3) == 0 then al = al + ((rnd(4) == 0) and -lean or lean) end
+                    root.n = root.n + 1
+                    root.a[root.n], root.d[root.n] = al, dp
+                    root.t[root.n] = start + (1 - start) * i / len
+                end
+                return al, dp
+            end
+            local lean = rnd(2) == 0 and 1 or -1
+            local start = (r - 1) * 0.12
+            local len = 10 + rnd(10)
+            -- (the main crack; a branch off its middle, the other way; a splinter out of the frame)
+            local mid = root.n + math.floor(len / 2)
+            run(0, 0, len, start, lean)
+            run(root.a[mid + 1], root.d[mid + 1], 4 + rnd(6), start + 0.35, -lean)
+            local stub = 2 + rnd(3)
+            for i = 1, stub do
+                root.n = root.n + 1
+                root.a[root.n], root.d[root.n] = i % 2 * lean, -i
+                root.t[root.n] = start + 0.5 * i / stub
+            end
+            roots[r] = root
+        end
+        frostKinds[k] = roots
+    end
+end
+
+local function menuSkinIs(skin)
+    if T.menuSkin ~= skin then
+        T.menuSkin = skin
+        T.applySkin()
+    end
+end
+
+--- The look of the bar's menu on or off: its ice skin (T.skin), the frost on the menu's items.
+--- (On when the bar is built, off when any scene goes.)
+function T.barLook(on)
+    T.frostOn = on == true
+    frostState = {}
+    menuSkinIs(on and "ice" or nil)
+end
+
+--- The look of the camp's menu: the sand (T.skin). Off with T.barLook(false), as any scene goes.
+function T.campLook()
+    menuSkinIs("sand")
+end
+
+--- An edge frosting: call each frame as it is drawn, `hot` under the mouse (a: its alpha; onPlate:
+--- it is a plate of the main colour, the light cracks of a dark button would not show on it).
+function T.frost(ui, x, y, w, h, hot, a, onPlate)
+    if not T.frostOn then return end
+    local mine = frostState[ui]
+    if not hot and not mine then return end
+    if not mine then
+        mine = {}
+        frostState[ui] = mine
+    end
+    -- (one per size: an item sliding in moves, its cracks with it - keyed by where it was, they started
+    -- anew every frame, flickering, and piled up: overhaul, 2026-11-04)
+    local key = w * 8192 + h
+    local e = mine[key]
+    if not hot and not e then return end
+    local now = getTimestampMs() / 1000
+    if hot then
+        -- (no longer drawn while it faded - the item's plate went first: it starts anew, it
+        -- doesn't come back grown)
+        if e and e.off and now - e.off >= FROST_FADE then
+            mine[key] = nil
+            e = nil
+        end
+        if not e then
+            if not T.animOn() then return end
+            if not frostKinds then frostMake() end
+            e = {at = now, kind = frostNext}
+            frostNext = frostNext % FROST_KINDS + 1
+            mine[key] = e
+        end
+        e.off = nil
+    elseif not e.off then
+        e.off = now
+    end
+    local fade = 1
+    if e.off then
+        fade = 1 - (now - e.off) / FROST_FADE
+        if fade <= 0 then
+            mine[key] = nil
+            return
+        end
+    end
+    local g = math.min(1, (now - e.at) / FROST_GROW)
+    g = math.floor((1 - (1 - g) * (1 - g)) * FROST_JERKS + 0.999) / FROST_JERKS
+    a = (a or 1) * fade
+    local c, chip = onPlate and T.color.ink or T.color.bright, T.color.window
+    -- (the crack's pixel: bigger on a big button, as far in as half of it)
+    local s = math.max(1, math.floor(math.min(w, h) / 24))
+    local deep = math.floor(math.min(w, h) * 0.5 / s) - 1
+    local round = 2 * (w + h)
+    for r = 1, FROST_ROOTS * (w > FROST_WIDE and 3 or 1) do
+        local root = frostKinds[(e.kind + math.floor((r - 1) / FROST_ROOTS) - 1) % FROST_KINDS + 1][(r - 1) % FROST_ROOTS + 1]
+        local p = root.p * round
+        local ox, oy, ax, ay, ix, iy
+        if p < w then ox, oy, ax, ay, ix, iy = x + p, y, 1, 0, 0, 1
+        elseif p < w + h then ox, oy, ax, ay, ix, iy = x + w - s, y + p - w, 0, 1, -1, 0
+        elseif p < 2 * w + h then ox, oy, ax, ay, ix, iy = x + w - (p - w - h), y + h - s, -1, 0, 0, -1
+        else ox, oy, ax, ay, ix, iy = x, y + h - (p - 2 * w - h), 0, -1, 1, 0 end
+        ox, oy = math.floor(ox), math.floor(oy)
+        -- (the chip out of the frame)
+        ui:drawRect(ox - s, oy - s, 3 * s, 3 * s, a, chip.r, chip.g, chip.b)
+        local n, aa, dd, tt = root.n, root.a, root.d, root.t
+        for i = 1, n do
+            local d = dd[i]
+            if tt[i] <= g and d <= deep then
+                -- (fainter as it goes in)
+                local fa = a * (d < 0 and 0.6 or (0.95 - 0.55 * d / math.max(1, deep)))
+                ui:drawRect(ox + (ax * aa[i] + ix * d) * s, oy + (ay * aa[i] + iy * d) * s, s, s, fa, c.r, c.g, c.b)
+            end
+        end
+    end
+end
+
+--- A texture on any four corners (px of `ui`: top left, top right, bottom right, bottom left
+--- of the picture) - turned, slanted, mirrored or in perspective (the pinned post's coin and
+--- its slanted shimmer, 2026-10-25). Tinted by c, `a` its alpha.
+function T.quad(ui, tex, x1, y1, x2, y2, x3, y3, x4, y4, c, a)
+    if not tex or a <= 0.003 or not ui.javaObject then return end
+    local ax, ay = ui:getAbsoluteX() + ui:getXScroll(), ui:getAbsoluteY() + ui:getYScroll()
+    ui.javaObject:DrawTexture(tex, ax + x1, ay + y1, ax + x2, ay + y2, ax + x3, ay + y3, ax + x4, ay + y4, c.r, c.g, c.b, a)
+end
+
+--- A picture only once the game has read it, else nil. (getTexture reads in the background,
+--- and a picture drawn before it is read shows the game's red-white error picture in its
+--- place - the pinned post's pictures flashed red-white squares, the author 2026-10-25.)
+--- Asked once, then looked up; T.preloadTex asks early.
+local readyTex, waitTex = {}, {}
+function T.readyTex(path)
+    local t = readyTex[path]
+    if t ~= nil then return t or nil end
+    local w = waitTex[path]
+    if w == nil then
+        w = getTexture(path) or false
+        waitTex[path] = w
+    end
+    if w and not w:isReady() then return nil end
+    readyTex[path], waitTex[path] = w, nil
+    return w or nil
+end
+
+--- Start reading these pictures now (a list of paths).
+function T.preloadTex(paths)
+    for _, p in ipairs(paths) do T.readyTex(p) end
+end
+
+--- One clip at a time on `ui`: T.clip moves it to x, y, w, h, T.unclip takes it off. (The
+--- game's clips do not intersect: one set inside another takes its place and, taken off,
+--- leaves its box cut out of the first - so a clip is moved, never nested. The pinned post's
+--- many boxes - its head, the view, the roadmap's cards - 2026-10-25.)
+function T.clip(ui, x, y, w, h)
+    if ui.knoxClip then ui:clearStencilRect() end
+    ui:setStencilRect(x, y, math.max(0, w), math.max(0, h))
+    ui.knoxClip = true
+end
+
+function T.unclip(ui)
+    if ui.knoxClip then
+        ui:clearStencilRect()
+        ui.knoxClip = nil
+    end
+end
+
+function T.inRect(x, y, r)
+    return x >= r[1] and y >= r[2] and x < r[1] + r[3] and y < r[2] + r[4]
+end
+
+--- Close button of a window header: a frame with a cross, sand on hover. Its
+--- frame is a button's: 1 px grey at rest, 2 px sand under the mouse (as every
+--- sand frame - a 1 px sand one beside a button's 2 px looked of another kind,
+--- 2026-10-14).
+function T.closeButton(ui, x, y, s, hover)
+    local c = hover and T.color.accent or T.color.text
+    if hover then T.tileFrame(ui, x, y, s, s, T.color.accent) else T.border(ui, x, y, s, s, T.color.tileEdge) end
+    -- two diagonals of 2 px dots over the same square [m, s - m) both ways
+    local m = math.floor(s / 3)
+    local n = s - 2 * m - 2
+    for i = 0, n do
+        ui:drawRect(x + m + i, y + m + i, 2, 2, 1, c.r, c.g, c.b)
+        ui:drawRect(x + s - m - 2 - i, y + m + i, 2, 2, 1, c.r, c.g, c.b)
+    end
+end
+
+--- A game UIFont about as tall as ont, for the game's own widgets (text
+--- boxes) that can't take Knox's fonts.
+function T.gameFont(font)
+    if type(font) ~= "table" then return font end
+    return gameFontUpTo(T.fontH(font) + 2)
+end
+
+-- (the "Layout" overlay: text placed by hand, not through the kit, gets an
+-- orange box round its letters - what is still to be moved onto the kit)
+function T.text(ui, s, x, y, c, font, a)
+    if T.layoutDebug() and s and s ~= "" and ui.javaObject then
+        local l, t, r, b = inkBox(font or T.fontText, s)
+        ui:drawRectBorder(x + l, y + t, r - l, b - t, 0.9, 1, 0.55, 0.1)
+    end
+    T.drawText(ui, s, x, y, c.r, c.g, c.b, a or 1, font or T.fontText)
+end
+
+function T.textRight(ui, s, x, y, c, font, a)
+    T.drawTextRight(ui, s, x, y, c.r, c.g, c.b, a or 1, font or T.fontText)
+end
+
+function T.textCentre(ui, s, x, y, c, font, a)   -- uilint: ok (old code; new: T.label)
+    T.drawTextCentre(ui, s, x, y, c.r, c.g, c.b, a or 1, font or T.fontText)   -- uilint: ok
+end
+
+--- A label in capitals (section titles, small labels), as in the mockup.
+function T.caps(ui, s, x, y, c, font, a)
+    T.text(ui, T.upper(s), x, y, c, font or T.fontCaps, a)
+end
+
+--- Button as in the mockup: dark plate, grey frame, caption in capitals;
+--- sand frame on hover; `primary` = sand plate with dark caption.
+--- r = {x, y, w, h}; opts = {hover, primary, disabled, active, font}
+function T.button(ui, r, text, opts)
+    opts = opts or {}
+    local font = opts.font or T.fontCaps
+    local primary, hover, disabled = opts.primary, opts.hover and not opts.disabled, opts.disabled
+    T.rect(ui, r[1], r[2], r[3], r[4], primary and T.color.accent or T.color.buttonBg)
+    local edge = (hover or opts.active) and T.color.accent or T.color.tileEdge
+    if primary then edge = T.color.accent end
+    if primary and hover then
+        -- the sand plate lights up, with a bright frame inside
+        ui:drawRect(r[1], r[2], r[3], r[4], 0.28, 1, 1, 1)
+        edge = T.color.bright
+        T.border(ui, r[1] + 1, r[2] + 1, r[3] - 2, r[4] - 2, edge)
+    end
+    T.border(ui, r[1], r[2], r[3], r[4], edge)
+    if hover and not primary then ui:drawRect(r[1], r[2], r[3], r[4], 0.05, 1, 1, 1) end
+    local c = primary and T.color.ink or (opts.color or T.color.text)
+    buttonOpts.font, buttonOpts.a = font, disabled and 0.3 or 1
+    T.label(ui, T.upper(text), r, c, buttonOpts)
+end
+
+--- Width a button needs for its caption.
+function T.buttonW(text, font)
+    return T.measure(font or T.fontCaps, T.upper(text)) + T.pad * 2
+end
+
+--- How wide a key's plate is: one letter or digit - all of one width, the widest letter's
+--- (M, W): G stood wider than F (the author 2026-11-08: "G should not be wider than F";
+--- Tab, Ctrl, Shift keep their own). Worked out once per font.
+local keyOneFont, keyOneW = nil, 0
+function T.keyW(key, font)
+    font = font or T.fontTile
+    if key ~= nil and string.len(key) == 1 then
+        if keyOneFont ~= font then
+            keyOneFont = font
+            keyOneW = math.max(T.measure(font, "M"), T.measure(font, "W")) + 10
+        end
+        return keyOneW
+    end
+    return T.measure(font, key or "") + 10
+end
+
+--- A key in a small frame ("[R]") followed by its label, for hint rows;
+--- returns the x after it.
+-- (`a`: how much it shows - the crosshair panel's hints fade as they change, KnoxCrosshair)
+-- (`keyFont`, `textFont`: the crosshair panel's own, at its size - the author 2026-11-13)
+function T.keyHint(ui, x, y, key, label, h, a, keyFont, textFont)
+    local font = keyFont or T.fontTile
+    local kw = T.keyW(key, font)
+    local kh = h or (T.fontH(font) + 4)
+    hintPlate[1], hintPlate[2], hintPlate[3], hintPlate[4] = x, y, kw, kh
+    hintPlateOpts.fill, hintPlateOpts.edge, hintPlateOpts.font, hintPlateOpts.a = T.color.header, T.color.tileEdge, font, a
+    T.plate(ui, hintPlate, key, hintPlateOpts)
+    x = x + kw + 6
+    hintBand[1], hintBand[2], hintBand[3], hintBand[4] = x, y, 0, kh
+    hintBandOpts.font, hintBandOpts.a = textFont or T.fontText, a
+    return x + T.label(ui, label, hintBand, T.color.dim, hintBandOpts)
+end
+
+--- Progress of a move: the faded tile fills up from the bottom with a light
+--- tint, a sand line on the fill's edge as thick as the tile's 2 px frame (the
+--- author's wish, 2026-10-15; the condition bar stays visible).
+function T.progress(ui, x, y, w, h, frac)
+    frac = math.max(0, math.min(1, frac))
+    local fh = math.floor(h * frac)
+    if fh <= 0 then return end
+    local c = T.color.accent
+    ui:drawRect(x, y + h - fh, w, fh, 0.16, c.r, c.g, c.b)
+    ui:drawRect(x, y + h - fh, w, math.min(2, fh), 0.9, c.r, c.g, c.b)
+end
+
+--- Text with a 1 px dark outline (readable over any icon), right-aligned at x.
+local OUTLINE = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}}   -- (made once: a stack's count is drawn every frame)
+
+function T.outlinedRight(ui, text, x, y, color, font, a)
+    a = a or 1
+    font = font or T.fontTile
+    local lx = x - T.measure(font, text)
+    for _, o in ipairs(OUTLINE) do
+        T.drawText(ui, text, lx + o[1], y + o[2], 0, 0, 0, 0.9 * a, font)
+    end
+    T.drawText(ui, text, lx, y, color.r, color.g, color.b, a, font)
+end
+
+-- A stack's count, a magazine's rounds (stack_count.html R2, the author 2026-11-13: the bare
+-- digits looked "naked"): a small plate in the tile's bottom right corner, its top and left edge
+-- the tile's own 2 px frame going on (same colour, not laid over it), the digits bold without
+-- a shadow (the author), a magazine's "/ what it holds" smaller and dim. Each part stands by its
+-- own pixels - the same margins for 5, 124, 13/15, the "/" in the middle of the height (by the
+-- font's widths they wandered 1-2 px: the critic, the author 2026-11-13 "не отцентровано").
+-- The picture of a thing with a count goes up a little (T.countLift).
+T.COUNT_PLATE = hex("#2b2f2e")
+
+--- How far up the picture of a thing with a count goes (KnoxTiles.lift: 3 px at 48).
+function T.countLift(cs)
+    return math.max(2, math.floor((cs or T.cell) * 3 / 48 + 0.5))
+end
+
+--- The plate with `n` (and "/cap" when given) in the corner of the tile x, y, w, h; `c` the
+--- number's colour, `frameC` the tile frame's (T.color.tileFrame).
+function T.tileCount(ui, x, y, w, h, n, cap, c, frameC, a)
+    a = a or 1
+    local fb = T.fontCount or T.fontTile
+    local fs = T.fontCountSmall or T.fontTile
+    local k = T.cell / 48
+    local ft = 2
+    local padX = math.max(2, math.floor(3 * k + 0.5))
+    local padY = math.max(1, math.floor(2 * k + 0.5))
+    local gap = math.max(1, math.floor(2 * k + 0.5))
+    local _, dt, _, db = inkBox(fb, "0123456789")
+    local l1, t1, r1, b1 = inkBox(fb, n)
+    local iw = r1 - l1
+    local l2, t2, r2, b2, l3, t3, r3, b3
+    if cap then
+        l2, t2, r2, b2 = inkBox(fs, "/")
+        l3, t3, r3, b3 = inkBox(fs, cap)
+        iw = iw + gap + (r2 - l2) + gap + (r3 - l3)
+    end
+    local pw, ph = ft + padX + iw + padX + ft, ft + padY + (db - dt) + padY + ft
+    local px, py = x + w - pw, y + h - ph
+    local p = T.COUNT_PLATE
+    frameC = frameC or T.color.tileFrame
+    local fr, fg, fbl = frameC.r, frameC.g, frameC.b
+    ui:drawRect(px, py, pw, ph, a, p.r, p.g, p.b)
+    ui:drawRect(px, py, pw, ft, a, fr, fg, fbl)                 -- its top edge
+    ui:drawRect(px, py + ft, ft, ph - ft, a, fr, fg, fbl)       -- its left edge
+    ui:drawRect(x + w - ft, py, ft, ph, a, fr, fg, fbl)         -- the tile's own frame under it, whole
+    ui:drawRect(px, y + h - ft, pw, ft, a, fr, fg, fbl)
+    -- each part: left to right by its pixels, in the middle of the plate's height
+    local iy, ih = py + ft, ph - 2 * ft
+    local cur = px + ft + padX
+    T.drawText(ui, n, cur - l1, iy + math.floor((ih - (b1 - t1)) / 2 + 0.5) - t1, c.r, c.g, c.b, a, fb)
+    if cap then
+        local d = T.color.dim
+        cur = cur + (r1 - l1) + gap
+        T.drawText(ui, "/", cur - l2, iy + math.floor((ih - (b2 - t2)) / 2 + 0.5) - t2, d.r, d.g, d.b, a, fs)
+        cur = cur + (r2 - l2) + gap
+        T.drawText(ui, cap, cur - l3, iy + math.floor((ih - (b3 - t3)) / 2 + 0.5) - t3, d.r, d.g, d.b, a, fs)
+    end
+end
+
+--- The same, left-aligned at x: a hotbar's key number over the fill of its tile
+--- (condition_v3, the author, 2026-10-31).
+function T.outlinedLeft(ui, text, x, y, color, font, a)
+    a = a or 1
+    font = font or T.fontTile
+    for _, o in ipairs(OUTLINE) do
+        T.drawText(ui, text, x + o[1], y + o[2], 0, 0, 0, 0.9 * a, font)
+    end
+    T.drawText(ui, text, x, y, color.r, color.g, color.b, a, font)
+end
+
+-- A thing's state is its category's colour itself (condition_v3, the author, 2026-10-31):
+-- filled from the bottom as high as its condition, or as what is left in it; above
+-- that the empty cell's dark. No state: as full. Broken: nothing, the icon in grey
+-- (the author, 2026-11-05). In place of the old thin meters (good/warn/bad and "0%").
+-- A magazine: as high as the parts of the menu on R; one not checked: stripes, not a
+-- height (the author, 2026-11-05: "?" and a dark icon were too weak).
+
+local function fluidOf(item)
+    local fluid = item:getFluidContainer()
+    if fluid then return fluid end
+    -- (on the ground the game moves a thing's liquid over to its object in the world)
+    local wi = item:getWorldItem()
+    return instanceof(wi, "IsoWorldInventoryObject") and wi:getFluidContainer() or nil
+end
+
+--- A magazine's parts lit of 5 for n rounds of cap (for 15: 15 - 5, 10-14 - 4, 6-9 - 3, 4-5 - 2,
+--- 1-3 - 1, 0 - 0): the tile can't tell more than the menu on R.
+function T.magParts(n, cap)
+    if cap <= 0 or n <= 0 then return 0 end
+    if n >= cap then return 5 end
+    local f = n / cap
+    if f >= 2 / 3 then return 4 end
+    if f >= 0.4 then return 3 end
+    if f >= 0.25 then return 2 end
+    return 1
+end
+
+--- The level of a magazine whose rounds the character doesn't know.
+T.LEVEL_UNKNOWN = -1
+
+--- A magazine's level, T.LEVEL_UNKNOWN if not checked (with the menu on R off nothing is
+--- hidden, as in the game).
+function T.magLevel(mag)
+    local K = KnoxMagKnown
+    if K and K.hide and not K.is(mag) then return T.LEVEL_UNKNOWN end
+    return T.magParts(mag:getCurrentAmmoCount(), mag:getMaxAmmo()) / 5
+end
+
+--- What a thing's level is read from: "c" condition, "u" uses, "f" liquid, "m" rounds, false none.
+--- (Worth keeping per item: the answer doesn't change, the level does.)
+function T.levelKind(item)
+    if (instanceof(item, "HandWeapon") or instanceof(item, "Clothing")) and item:getConditionMax() > 0 then return "c" end
+    if item:IsDrainable() then return "u" end
+    if not instanceof(item, "HandWeapon") and item:getMaxAmmo() > 0 then return "m" end
+    local fluid = fluidOf(item)
+    if fluid and fluid:getCapacity() > 0 then return "f" end
+    return false
+end
+
+--- How much of a thing there is: 0..1, nil when it has no state. `kind`: T.levelKind's
+--- answer if known.
+function T.itemLevel(item, kind)
+    if item:isBroken() then return 0 end
+    if kind == nil then kind = T.levelKind(item) end
+    if kind == "c" then return item:getCondition() / math.max(1, item:getConditionMax()) end
+    if kind == "u" then return item:getCurrentUsesFloat() end
+    if kind == "m" then return T.magLevel(item) end
+    if kind == "f" then
+        local fluid = fluidOf(item)
+        if fluid and fluid:getCapacity() > 0 then return fluid:getAmount() / fluid:getCapacity() end
+    end
+    return nil
+end
+
+--- The same for a slot drawn every frame: what it is read from asked of the item once,
+--- kept in `memo` (one table per slot).
+--- A dragged thing's tile (a copy at the mouse): its colour's glow and its state, as its tile
+--- in a bag (the author 2026-11-14: the copy was a flat colour, no state). `d`: the grid
+--- tile's draw info when there is one (a stack's state, the frozen tint).
+function T.dragTile(ui, item, x, y, w, h, d, a)
+    local level = d and d.level or T.itemLevel(item, T.levelKind(item))
+    local cat = d and d.cat or T.itemColor(item, T.category[T.categoryOf(item)])
+    T.tileFill(ui, x, y, w, h, level, cat, a)
+end
+
+function T.levelOf(memo, item)
+    if memo.levelFor ~= item then memo.levelFor, memo.levelFrom = item, T.levelKind(item) end
+    return T.itemLevel(item, memo.levelFrom)
+end
+
+local function fillH(h, level)
+    return math.max(4, math.floor((h - 6) * math.min(1, level) + 0.5))
+end
+
+--- What a slot's ready list goes by for a level: only a change that shows (a burning
+--- torch's charge moves all the time, the colour's height seldom), broken apart from
+--- merely empty.
+function T.levelKey(item, h, level)
+    if not level then return -1 end
+    if level == T.LEVEL_UNKNOWN then return -3 end
+    if level <= 0 then return item:isBroken() and -2 or 0 end
+    return fillH(h, level)
+end
+
+--- A magazine not checked: stripes in its colour inside the frame, 1:1. (No stripes to be
+--- had: an even half of the colour.)
+function T.tileHatch(ui, x, y, w, h, color, a)
+    local hatch = knoxHatch and knoxHatch(w - 4, h - 5)
+    if hatch then
+        ui:drawTextureScaled(hatch, x + 2, y + 2, w - 4, h - 5, a, color.r, color.g, color.b)
+    else
+        T.rect(ui, x + 2, y + 2, w - 4, h - 5, color, 0.5 * a)
+    end
+end
+
+--- A plate in a category's colour with its glow (the tooltip's and the item menu's header -
+--- the author 2026-11-14: "шапки в подсказке тоже должны иметь такой же градиент"): the deep
+--- shade over x, y, w, h, the glow over its inside `inset` px in (inside its frame). A colour
+--- without a glow: flat.
+local glowTex
+local glowMade = {}
+--- `c` with its glow's colours (`hi`, `lo` as T.category's): a category's own, else made
+--- once for it - a panel's header in the skin's colour glows the same way (the author
+--- 2026-11-14: the crosshair panel's and the R menu's headers).
+function T.glowOf(c)
+    if c.hi then return c end
+    local g = glowMade[c]
+    if not g then
+        local h, s, l = hslOf(c)
+        g = {r = c.r, g = c.g, b = c.b,
+             hi = fromHsl(h, math.min(1, s * 1.95), math.min(0.5, l * 1.55)),
+             lo = fromHsl(h, math.min(1, s * 1.1), l * 0.7)}
+        glowMade[c] = g
+    end
+    return g
+end
+
+function T.glowRect(ui, x, y, w, h, color, a, inset)
+    a = a or 1
+    color = T.glowOf(color)
+    local lo, hi = color.lo, color.hi
+    if not hi then
+        T.rect(ui, x, y, w, h, color, a)
+        return
+    end
+    T.rect(ui, x, y, w, h, lo, a)
+    glowTex = glowTex or getTexture("media/ui/knox_tile_glow.png")
+    inset = inset or 0
+    if glowTex and w > inset * 2 and h > inset * 2 then
+        ui:drawTextureScaled(glowTex, x + inset, y + inset, w - inset * 2, h - inset * 2, a, hi.r, hi.g, hi.b)
+    end
+end
+
+--- A tile's background: `color` filled up to `level` inside its 2 px frame, nil as full
+--- (the mockup: with no state and at 100% alike). (KnoxTiles.java draws the same for a
+--- grid's quiet tiles.)
+function T.tileFill(ui, x, y, w, h, level, color, a)
+    a = a or 1
+    level = level or 1
+    -- (the category's glow: drawn by the Java part, jar 158 - an older one, the flat colour)
+    if level ~= T.LEVEL_UNKNOWN and color and color.hi and knoxTileFill then
+        knoxTileFill(ui.javaObject, x, y, w, h, level, color, a, T.color.cell)
+        return
+    end
+    T.rect(ui, x, y, w, h, T.color.cell, a)
+    if level == T.LEVEL_UNKNOWN then
+        T.tileHatch(ui, x, y, w, h, color, a)
+        return
+    end
+    if level <= 0 then return end
+    local fh = fillH(h, level)
+    T.rect(ui, x + 2, y + h - 3 - fh, w - 4, fh + 1, color, a)
+end
+
+--- A broken thing's picture in grey (the author, 2026-11-05: the cross and the x0.2 were
+--- "very aggressive, you can't tell which thing is broken"), nil while there is none.
+--- (The Java part makes it once, it is kept here so that a frame asks it nothing.)
+local greyOf = {}
+function T.greyIcon(tex)
+    local grey = greyOf[tex]
+    if grey then return grey end
+    grey = knoxGreyIcon and knoxGreyIcon(tex) or nil
+    if grey then greyOf[tex] = grey end
+    return grey
+end
+
+--- How bright a broken thing's grey picture is drawn.
+T.BROKEN_GREY = 0.72
+
+--- A broken thing's icon: its picture in grey (without its liquid). No grey to be had:
+--- dimmed in its own colour.
+function T.brokenIcon(ui, item, x, y, side, a)
+    local tex = item:getTex()
+    if not tex then return end
+    local grey = T.greyIcon(tex)
+    if grey then
+        local k = T.BROKEN_GREY
+        ui:drawTextureScaledAspect(grey, x, y, side, side, a or 1, k, k, k)
+        return
+    end
+    local r, g, b = 0.6, 0.6, 0.6
+    if not item:getTextureColorMask() then r, g, b = item:getR() * 0.6, item:getG() * 0.6, item:getB() * 0.6 end
+    ui:drawTextureScaledAspect(tex, x, y, side, side, a or 1, r, g, b)
+end
+
+--- A thing's icon: as ever, or in grey when broken.
+function T.itemIcon(ui, item, x, y, side, a)
+    if item:isBroken() then
+        T.brokenIcon(ui, item, x, y, side, a)
+        return
+    end
+    ISInventoryItem.renderItemIcon(ui, item, x, y, a, side, side)
+end
+
+--- A worn item that the move being considered would take off: red tint and
+--- a 2 px red frame.
+function T.replaceMark(ui, x, y, w, h)
+    local c = T.color.bad
+    ui:drawRect(x, y, w, h, 0.18, c.r, c.g, c.b)
+    T.border(ui, x, y, w, h, c)
+    T.border(ui, x + 1, y + 1, w - 2, h - 2, c)
+end
+
+--- An item the character is using right now (eating, drinking, bandaging...):
+--- a 2 px sand frame, like a selected tile, and the fill of the action's progress.
+function T.inUse(ui, x, y, w, h, frac)
+    T.border(ui, x, y, w, h, T.color.accent)
+    T.border(ui, x + 1, y + 1, w - 2, h - 2, T.color.accent)
+    T.progress(ui, x, y, w, h, frac)
+end
+
+--- Turn of a move among several (on its faded copy): a sand square with the
+--- number in dark ink, in the tile's top-left corner.
+function T.turnBadge(ui, x, y, n)
+    local text = tostring(n)
+    local h = T.fontTileH + 4
+    local w = math.max(h, T.measure(T.fontTile, text) + 8)
+    T.rect(ui, x + 2, y + 2, w, h, T.color.accent)
+    T.textCentre(ui, text, x + 2 + math.floor(w / 2), y + 4, T.color.ink, T.fontTile)
+end
+
+--- Where a moving item will land: a thin frame and faint tint that slowly
+--- breathe, so it doesn't read as the drop highlight or as the item itself.
+--- `k`: 0..1, how far it has faded in (default 1).
+function T.target(ui, x, y, w, h, c, k)
+    local t = getTimestampMs() / 1000
+    local p = 0.5 + 0.5 * math.sin(t * math.pi * 1.6)
+    c = c or T.color.accent
+    k = k or 1
+    ui:drawRect(x, y, w, h, (0.04 + 0.06 * p) * k, c.r, c.g, c.b)
+    ui:drawRectBorder(x, y, w, h, (0.35 + 0.5 * p) * k, c.r, c.g, c.b)
+end
+
+--- What fits the thing under the mouse (rounds for a magazine, batteries for a
+--- flashlight...): like T.target, but a 2 px frame in a light green, strong at
+--- every breath - T.target's 1 px green was lost on a weapon's green tile (the
+--- author, 2026-10-30: "хочется ярче").
+--- `k`: 0..1, how far it has faded in (default 1).
+function T.fits(ui, x, y, w, h, k)
+    local t = getTimestampMs() / 1000
+    local p = 0.5 + 0.5 * math.sin(t * math.pi * 1.6)
+    local c = T.color.fits
+    k = k or 1
+    local a = (0.7 + 0.3 * p) * k
+    ui:drawRect(x, y, w, h, (0.10 + 0.08 * p) * k, c.r, c.g, c.b)
+    ui:drawRectBorder(x, y, w, h, a, c.r, c.g, c.b)
+    ui:drawRectBorder(x + 1, y + 1, w - 2, h - 2, a, c.r, c.g, c.b)
+end
+
+--- Text split into lines no wider than `width`, at spaces (line breaks in the
+--- text are joined). A word wider than a line on its own is cut between
+--- characters: languages written without spaces (Chinese, Japanese) wrap too.
+function T.wrap(text, font, width)
+    text = string.gsub(text or "", "%s*\n%s*", " ")
+    local lines, line = {}, ""
+    local function push(word)
+        local try = line == "" and word or (line .. " " .. word)
+        if line == "" or T.measure(font, try) <= width then
+            line = try
+        else
+            table.insert(lines, line)
+            line = word
+        end
+    end
+    for word in string.gmatch(text, "%S+") do
+        if T.measure(font, word) <= width then
+            push(word)
+        else
+            -- too long for any line: as many characters per line as fit
+            if line ~= "" then table.insert(lines, line) line = "" end
+            local piece = ""
+            for i = 1, string.len(word) do
+                local ch = string.sub(word, i, i)
+                if piece ~= "" and T.measure(font, piece .. ch) > width then
+                    table.insert(lines, piece)
+                    piece = ch
+                else
+                    piece = piece .. ch
+                end
+            end
+            line = piece
+        end
+    end
+    if line ~= "" then table.insert(lines, line) end
+    return lines
+end
+
+--- T.wrap for a whole message: its paragraphs and blank lines stay, the result
+--- is one string with line breaks. (ISModalDialog wraps nothing and grows to its
+--- longest line, off the screen; a Discord player could not read the end of the
+--- Java message, the author 2026-11-06.)
+function T.wrapMessage(text, font, width)
+    text = string.gsub(text or "", "\\n", "\n") .. "\n"
+    local out, pos = {}, 1
+    while pos <= string.len(text) do
+        local stop = string.find(text, "\n", pos, true)
+        local lines = T.wrap(string.sub(text, pos, stop - 1), font, width)
+        if #lines == 0 then table.insert(out, "") end
+        for i = 1, #lines do table.insert(out, lines[i]) end
+        pos = stop + 1
+    end
+    return table.concat(out, "\n")
+end
+
+local fitCache, fitCount = {}, 0
+
+--- Text cut to fit `width`, with a trailing dot when shortened.
+-- (by font, width, text: a key made of the three was new strings each ask - every
+-- equipment slot's name, every frame; the author's FPS task 2026-10-28)
+function T.fit(s, font, width)
+    local fkey = type(font) == "table" and font.key or tostring(font)
+    local byFont = fitCache[fkey]
+    local byWidth = byFont and byFont[width]
+    local hit = byWidth and byWidth[s]
+    if hit then return hit end
+    fitCount = fitCount + 1
+    if fitCount > CACHE_MAX then fitCache, fitCount, byFont, byWidth = {}, 1, nil, nil end
+    if not byFont then
+        byFont = {}
+        fitCache[fkey] = byFont
+    end
+    if not byWidth then
+        byWidth = {}
+        byFont[width] = byWidth
+    end
+    local out = s
+    if T.measure(font, s) > width then
+        out = ""
+        for n = string.len(s) - 1, 1, -1 do
+            local cut = string.sub(s, 1, n) .. "."
+            if T.measure(font, cut) <= width then out = cut break end
+        end
+    end
+    byWidth[s] = out
+    return out
+end
+
+--- One line of text in w px from x: a longer one is not cut but slides, smoothly,
+--- to show its end, waits, and slides back (the radio card's way, KnoxMenuMusic;
+--- the author, 2026-10-18: no "..." on long names). `st`: a table kept with the
+--- line - when its text changes the slide starts over. `outer` ({x, y, w, h} on the
+--- element, not scrolled): a clip the line is drawn inside - its box is painted back
+--- to that clip's level, or it stays a hole in it (the game's clips nest, see
+--- KnoxCrosshair's pushClip).
+local MARQUEE_HOLD, MARQUEE_SPEED = 1300, 45   -- ms at each end, px a second
+function T.marquee(ui, st, s, x, y, w, c, font, a, outer)
+    a = a or 1
+    local over = T.measure(font, s) - w
+    if over <= 0 then
+        T.text(ui, s, x, y, c, font, a)
+        return
+    end
+    local now = getTimestampMs()
+    if st.text ~= s then st.text, st.since = s, now end
+    local move = over / MARQUEE_SPEED * 1000
+    local t = (now - st.since) % (2 * (MARQUEE_HOLD + move))
+    local p
+    if not T.animOn() then p = 0
+    elseif t < MARQUEE_HOLD then p = 0
+    elseif t < MARQUEE_HOLD + move then p = (t - MARQUEE_HOLD) / move
+    elseif t < 2 * MARQUEE_HOLD + move then p = 1
+    else p = 1 - (t - 2 * MARQUEE_HOLD - move) / move end
+    p = (1 - math.cos(math.pi * p)) / 2               -- (eased at both ends)
+    -- (a clip is on the element, not in its scrolled content: left where the line stood
+    -- unscrolled, it cut the name away and the box stayed a black hole over the grid -
+    -- the players' "black bars", SullenestGrunt's screenshots, 2026-11-05)
+    local bx, by, bh = x + ui:getXScroll(), y - 2 + ui:getYScroll(), T.fontH(font) + 4
+    ui:setStencilRect(bx, by, w, bh)
+    T.text(ui, s, x - math.floor(over * p + 0.5), y, c, font, a)
+    ui:clearStencilRect()
+    if outer then
+        local x2, y2 = math.min(bx + w, outer[1] + outer[3]), math.min(by + bh, outer[2] + outer[4])
+        bx, by = math.max(bx, outer[1]), math.max(by, outer[2])
+        if x2 > bx and y2 > by then ui:repaintStencilRect(bx, by, x2 - bx, y2 - by) end
+    end
+end
+
+-- How far food is frozen or cooked, shown on its tile and on its tooltip's
+-- plate as a bar filling from the bottom, like the bar of a move:
+--   frozen - a blue bar, sinking as it thaws;
+--   on the heat - a sand tint with an orange bar rising; full: done;
+--   left on - orange with a red bar rising; full: burnt.
+local COOK_BLUE = {r = 0.29, g = 0.56, b = 0.82}
+local COOK_ORANGE = {r = 0.88, g = 0.54, b = 0.17}
+T.COOK_BLUE = COOK_BLUE
+-- a frozen tile's frame: the ice's own blue, lighter - the grey-green frame of
+-- other tiles read as a yellowish edge on the blue (the author, 2026-10-18)
+T.FROZEN_FRAME = {r = 0.50, g = 0.69, b = 0.87}
+T.FROZEN_HOVER = {r = 0.70, g = 0.82, b = 0.93}
+
+--- a modulo n, always 0 <= result < n. (The game's Lua takes "%" as Java's
+--- remainder: -2 % 10 is -2 there, not 8 - found 2026-10-15, "back" from the
+--- first track of the menu's player gave an index of -1.)
+function T.mod(a, n)
+    return a - math.floor(a / n) * n
+end
+
+function T.mix(a, b, k)
+    return T.mixInto({}, a, b, k)
+end
+
+--- T.mix into a table kept by the caller (a colour worked out every frame: no new table).
+function T.mixInto(out, a, b, k)
+    k = math.max(0, math.min(1, k))
+    out.r, out.g, out.b = a.r + (b.r - a.r) * k, a.g + (b.g - a.g) * k, a.b + (b.b - a.b) * k
+    return out
+end
+
+--- A category's colour taken towards `t` by k (frozen, cooking, hot - as the old tint laid over
+--- the tile at alpha k), its glow's colours too: the tile and its header glow in the colour it
+--- shows (the author 2026-11-14: a frozen bottle had no glow, its tooltip no frost). Kept.
+local tintOf = {}
+function T.tintCat(c, t, k)
+    if not c or not t or not k or k <= 0 then return c end
+    local q = math.floor(math.min(1, k) * 40 + 0.5)
+    local byC = tintOf[c]
+    if not byC then
+        byC = {}
+        tintOf[c] = byC
+    end
+    local byT = byC[t]
+    if not byT then
+        byT = {}
+        byC[t] = byT
+    end
+    local out = byT[q]
+    if not out then
+        local kk = q / 40
+        out = T.mix(c, t, kk)
+        if c.hi then
+            -- (its glow made anew from the tinted colour, as strong as any tile's: the tint
+            -- laid over both ends of the glow flattened it - the author 2026-11-14)
+            local h, s, l = hslOf(out)
+            out.hi = fromHsl(h, math.min(1, s * 1.95), math.min(0.5, l * 1.55))
+            out.lo = fromHsl(h, math.min(1, s * 1.1), l * 0.7)
+        end
+        byT[q] = out
+    end
+    return out
+end
+
+--- A thing's category colour as its tile shows it: frozen, cooking, done, burning, hot or cold.
+--- (`c`: the category colour to start from, when the caller has it already)
+function T.itemColor(item, c)
+    c = c or T.category[T.categoryOf(item)]
+    local base = T.cookState(item)
+    if base then c = T.tintCat(c, base, 0.22) end
+    local heat, hk = T.heatState(item)
+    if heat then c = T.tintCat(c, heat, 0.6 * hk) end
+    return c
+end
+
+--- @return table|nil base (a tint under the bar), table|nil bar color, number bar 0..1
+function T.cookState(item)
+    if not instanceof(item, "Food") then return nil end
+    if item:isBurnt() then return nil, T.color.bad, 1 end
+    local frozen = item:getFreezingTime() or 0          -- 0..100
+    if frozen > 0 then return nil, COOK_BLUE, math.min(1, frozen / 100) end
+    if not item:isCookable() then return nil end
+    local t, cook, burn = item:getCookingTime() or 0, item:getMinutesToCook() or 0, item:getMinutesToBurn() or 0
+    if item:isCooked() then
+        local k = (burn > cook) and (t - cook) / (burn - cook) or 0
+        return COOK_ORANGE, T.color.bad, math.max(0, math.min(1, k))
+    end
+    if t > 0 and cook > 0 then return T.color.accent, COOK_ORANGE, math.min(1, t / cook) end
+    return nil
+end
+
+-- How hot or cold a thing is, as the game's own inventory shows it: its row
+-- tinted red when the thing is hot, blue when cold, stronger the further from
+-- room temperature (ISInventoryPane: getItemHeat, getInvHeat). On Extinction
+-- the game hides whether water is tainted, and players boil it "until it's red
+-- hot" by that tint - a pot on a Knox tile showed nothing (a player's report,
+-- 2026-10-15). Food keeps its own cooking colours (T.cookState).
+local HEAT_RED = {r = 0.85, g = 0.18, b = 0.12}
+
+--- @return table|nil colour, number strength 0..1
+function T.heatState(item)
+    if instanceof(item, "Food") then return nil, 0 end
+    local h = item:getItemHeat() or 1
+    if h == 1 then return nil, 0 end
+    local k = math.min(1, math.abs(item:getInvHeat() or 0))
+    if k < 0.02 then return nil, 0 end
+    return h > 1 and HEAT_RED or COOK_BLUE, k
+end
+
+--- Draw that over a plate x, y, w, h (nothing for food that is neither).
+function T.cookBar(ui, x, y, w, h, item, alpha)
+    local base, bar, frac = T.cookState(item)
+    alpha = alpha or 1
+    if base then ui:drawRect(x, y, w, h, 0.22 * alpha, base.r, base.g, base.b) end
+    if not bar then return end
+    local fh = math.floor(h * frac + 0.5)
+    if fh <= 0 then return end
+    ui:drawRect(x, y + h - fh, w, fh, 0.5 * alpha, bar.r, bar.g, bar.b)
+    ui:drawRect(x, y + h - fh, w, math.min(2, fh), 0.95 * alpha, bar.r, bar.g, bar.b)
+end
+-- A thing that has just come into a slot (put on, taken in hand, hung on the
+-- belt) settles into it as a tile settles into its cells: it drops in from a
+-- little above, fading in. `holder`: any table that lasts as long as the slot
+-- (the slot itself); the first item it is asked about is taken as already there.
+-- @return number dy to draw it at, number alpha factor
+function T.settleIn(holder, item)
+    local now = getTimestampMs()
+    local s = holder.knoxSettle
+    if not s then
+        s = {item = item, ms = 0}
+        holder.knoxSettle = s
+    elseif s.item ~= item then
+        s.item = item
+        s.ms = item and now or 0
+    end
+    if not item then return 0, 1 end
+    local t = T.anim((now - s.ms) / 160)
+    if t >= 1 then return 0, 1 end
+    local k = (1 - t) * (1 - t)
+    return -math.floor(T.cell * 0.22 * k + 0.5), 0.35 + 0.65 * t
+end
+
+-- A window unfolding as it opens and folding as it closes: for a moment only
+-- its plate is drawn, small and faint at the thing it belongs to (a tile, a
+-- slot; else its own middle), growing into its place - then the window with
+-- all in it; and the same backwards when it is closed. Its children are hidden
+-- meanwhile.
+--   T.unfold(win, sx, sy, sw, sh)  first thing in the window's prerender, with
+--       the source's rect on the screen if there is one; true = still folding
+--       or unfolding, draw nothing else this frame. Opening starts at
+--       win.openedMs, or at the first call.
+--   T.fold(win, finish)  in the window's close(), in place of taking it off
+--       the screen: `finish(win)` does that once it has folded away (outside of
+--       drawing: elements may not be removed while the UI draws). What the
+--       window stood for - its place in lists, "the open window" - is to be
+--       cleared by close() at once, not in `finish`.
+local UNFOLD_MS, FOLD_MS = 170, 130
+T.folding = {}
+
+local function foldPlate(win, k, sx, sy, sw, sh)
+    local w, h = win:getWidth(), win:getHeight()
+    if sx then
+        sx, sy = sx - win:getAbsoluteX(), sy - win:getAbsoluteY()
+    else
+        sw, sh = w * 0.3, h * 0.3
+        sx, sy = (w - sw) / 2, (h - sh) / 2
+    end
+    local x, y = math.floor(sx * (1 - k)), math.floor(sy * (1 - k))
+    local fw, fh = math.floor(sw + (w - sw) * k), math.floor(sh + (h - sh) * k)
+    local a = 0.15 + 0.8 * k
+    T.rect(win, x, y, fw, fh, T.color.window, a)
+    T.rect(win, x, y, fw, math.min(fh, math.floor((T.sectionH + 4) * k + 0.5)), T.color.header, a)
+    T.border(win, x, y, fw, fh, T.color.accent, a)
+end
+
+function T.unfold(win, sx, sy, sw, sh)
+    local now = getTimestampMs()
+    if win.foldMs then
+        -- closing: the plate shrinks back to where it came from
+        local t = math.min(1, T.anim((now - win.foldMs) / FOLD_MS))
+        local k = (1 - t) * (1 - t)
+        if k > 0.01 then foldPlate(win, k, sx, sy, sw, sh) end
+        return true
+    end
+    if not win.openedMs then win.openedMs = now end
+    local t = T.anim((now - win.openedMs) / UNFOLD_MS)
+    if t >= 1 then
+        if win.unfoldHid then
+            for _, child in ipairs(win.unfoldHid) do child:setVisible(true) end
+            win.unfoldHid = nil
+        end
+        return false
+    end
+    if not win.unfoldHid then
+        win.unfoldHid = {}
+        for _, child in pairs(win.children or {}) do
+            if child:getIsVisible() then
+                child:setVisible(false)
+                table.insert(win.unfoldHid, child)
+            end
+        end
+    end
+    foldPlate(win, 1 - (1 - t) * (1 - t), sx, sy, sw, sh)
+    return true
+end
+
+function T.fold(win, finish)
+    if win.foldMs then return end
+    win.foldMs = getTimestampMs()
+    win.foldFinish = finish
+    win.unfoldHid = nil
+    for _, child in pairs(win.children or {}) do
+        if child:getIsVisible() then child:setVisible(false) end
+    end
+    table.insert(T.folding, win)
+end
+
+Events.OnPreUIDraw.Add(function()
+    if #T.folding == 0 then return end
+    local now = getTimestampMs()
+    local keep = {}
+    for _, win in ipairs(T.folding) do
+        if T.anim((now - win.foldMs) / FOLD_MS) >= 1 then
+            local finish = win.foldFinish
+            win.foldFinish = nil
+            if finish then finish(win) end
+        else
+            table.insert(keep, win)
+        end
+    end
+    T.folding = keep
+end)
+
+-- the skin the player chose, from the first frame on
+T.applySkin()
+
+return KnoxTheme
